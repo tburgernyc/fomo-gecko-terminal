@@ -1,0 +1,6 @@
+.env
+*.duckdb
+*.duckdb.wal
+__pycache__/
+.pytest_cache/
+morning_quantstats_tearsheet.html
