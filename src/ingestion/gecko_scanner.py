@@ -112,11 +112,14 @@ class GeckoTerminalScanner:
         reserve = float(attributes.get("reserve_in_usd") or 0)
         volume = float((attributes.get("volume_usd") or {}).get("h24") or 0)
         price = float(attributes.get("base_token_price_usd") or 0)
+        fdv = float(attributes.get("fdv_usd") or 0)
         result: dict[str, Any] = {
             "network": slug,
             "pool_address": pool_address,
             "reserve_in_usd": reserve,
             "volume_24h_usd": volume,
+            "volume_usd_h24": volume,
+            "fdv_usd": fdv,
             "price_usd": price,
             "passed": False,
             "reason": "",

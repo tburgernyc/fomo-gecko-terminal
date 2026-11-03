@@ -6,6 +6,7 @@ from typing import Any
 
 import duckdb
 import httpx
+import pandas as pd
 
 from src.config import Settings, get_settings
 from src.db import cursor_scope, transaction_scope
@@ -15,6 +16,35 @@ from src.quant.allocator import PortfolioAllocator
 from src.utils.notifications import send_alert
 
 logger = logging.getLogger(__name__)
+
+
+def passes_memecoin_microstructure_gates(
+    pool_metrics: dict[str, Any],
+    ohlcv_df: pd.DataFrame | None = None,
+) -> tuple[bool, str]:
+    """Apply anti-rug and anti-exit-liquidity rules to a prospective entry."""
+    fdv = float(pool_metrics.get("fdv_usd") or 0.0)
+    vol_24h = float(pool_metrics.get("volume_usd_h24") or 0.0)
+    reserve_usd = float(pool_metrics.get("reserve_in_usd") or 0.0)
+
+    if 30_000 <= fdv <= 75_000:
+        return False, f"Rejected: Token in pre-migration sniper dump zone (FDV=${fdv:,.0f})"
+
+    if fdv > 0 and fdv < 1_000_000 and (vol_24h / fdv) < 0.50:
+        return False, f"Rejected: Weak Volume/FDV turnover ({vol_24h / fdv:.2f}x < 0.50x)"
+
+    if ohlcv_df is not None and len(ohlcv_df) >= 12:
+        recent = ohlcv_df.tail(12)
+        green_ratio = (recent["close"] >= recent["open"]).mean()
+        pct_changes = recent["close"].pct_change().dropna()
+        if green_ratio > 0.85 and pct_changes.std() < 0.008:
+            return False, "Rejected: Deceptive stair-step candlestick pattern detected"
+
+        last_candle = recent.iloc[-1]
+        if last_candle["close"] > last_candle["open"] * 1.03:
+            return False, "Rejected: Refusing to chase >3% green spike candle; waiting for pullback"
+
+    return True, "Passed microstructure gates"
 
 
 class ExecutionGatekeeper:
@@ -277,8 +307,25 @@ class ExecutionGatekeeper:
                     [signal_id, trader_handle, execution_network, token_address, normalized_side],
                 )
 
-            market = await self.scanner.evaluate_token(client, execution_network, token_address)
+            market = dict(
+                await self.scanner.evaluate_token(client, execution_network, token_address)
+            )
             execution_network = str(market.get("network") or execution_network)
+            pool_metrics = {
+                "fdv_usd": market.get("fdv_usd"),
+                "volume_usd_h24": (
+                    market.get("volume_usd_h24")
+                    if market.get("volume_usd_h24") is not None
+                    else market.get("volume_24h_usd")
+                ),
+                "reserve_in_usd": (
+                    market.get("reserve_in_usd")
+                    if market.get("reserve_in_usd") is not None
+                    else market.get("liquidity_usd")
+                ),
+            }
+            market["volume_24h_usd"] = pool_metrics["volume_usd_h24"]
+            market["reserve_in_usd"] = pool_metrics["reserve_in_usd"]
             consensus = self._consensus_count(execution_network, token_address)
             reject_reason = ""
             if not market.get("passed"):
@@ -291,6 +338,27 @@ class ExecutionGatekeeper:
                 and consensus < 2
             ):
                 reject_reason = f"rsi_overbought:{float(market['rsi_14']):.1f}"
+            if normalized_side == "BUY" and not reject_reason:
+                ohlcv_df = market.get("ohlcv_df")
+                if not isinstance(ohlcv_df, pd.DataFrame):
+                    candles = market.get("candles")
+                    ohlcv_df = (
+                        pd.DataFrame(candles)
+                        if isinstance(candles, list) and candles
+                        else None
+                    )
+                passed, microstructure_reason = passes_memecoin_microstructure_gates(
+                    pool_metrics, ohlcv_df
+                )
+                if not passed:
+                    reject_reason = microstructure_reason
+                    logger.warning(
+                        "Microstructure gate rejected %s (%s on %s): %s",
+                        trader_handle,
+                        token_address,
+                        execution_network,
+                        reject_reason,
+                    )
 
             with transaction_scope(self.db) as cur:
                 cur.execute(

@@ -15,6 +15,31 @@ from src.quant.allocator import PortfolioAllocator
 
 logger = logging.getLogger(__name__)
 TradeCallback = Callable[[str, str, str, str, float], Awaitable[str]]
+FOMO_API_KEY_PLACEHOLDER = "your_pumpfomo_or_fomoradar_api_key_here"
+GECKOTERMINAL_TRENDING_POOLS = "/networks/solana/trending_pools"
+
+
+def _seed_trader_profiles() -> list[dict[str, Any]]:
+    return [
+        {
+            "user_id": f"keyless-demo-{rank:02d}",
+            "userHandle": f"keyless_demo_{rank:02d}",
+            "handle": f"keyless_demo_{rank:02d}",
+            "display_name": f"Keyless Demo Trader {rank:02d}",
+            "rank": rank,
+            "wallet_address": None,
+            "chain": "solana" if rank % 2 else "base",
+            "pnl24h": float(1200 - rank * 75),
+            "pnl_24h_usd": float(1200 - rank * 75),
+            "pnl7d": float(6000 - rank * 350),
+            "win_rate": 0.62 + (rank % 4) * 0.04,
+            "trades": 12 + rank,
+            "numTrades": 12 + rank,
+            "is_demo": True,
+            "verified": False,
+        }
+        for rank in range(1, 11)
+    ]
 
 
 def _retryable_http_error(exc: BaseException) -> bool:
@@ -43,12 +68,87 @@ class FomoLeaderboardClient:
 
     def _headers(self, cache_key: str) -> dict[str, str]:
         headers = {"Accept": "application/json", "User-Agent": "FomoGeckoTerminal/1.0"}
-        api_key = self.settings.fomo_api_key.get_secret_value()
+        api_key = self.settings.fomo_api_key.get_secret_value().strip()
+        if api_key.lower() == FOMO_API_KEY_PLACEHOLDER:
+            api_key = ""
         if api_key:
             headers["X-API-Key"] = api_key
         if cache_key in self._etags:
             headers["If-None-Match"] = self._etags[cache_key]
         return headers
+
+    def _has_fomo_api_key(self) -> bool:
+        api_key = self.settings.fomo_api_key.get_secret_value().strip()
+        return bool(api_key and api_key.lower() != FOMO_API_KEY_PLACEHOLDER)
+
+    @staticmethod
+    def _warn_keyless_fallback(status_code: int | str) -> None:
+        logger.warning(
+            "FOMO API key missing or unauthorized (HTTP %s); activating keyless GeckoTerminal V2 fallback mode.",
+            status_code,
+        )
+
+    async def _poll_geckoterminal_trending(
+        self, client: httpx.AsyncClient, on_signal: TradeCallback
+    ) -> None:
+        if not self.settings.dry_run:
+            logger.error("Keyless GeckoTerminal signal fallback is disabled outside dry-run mode.")
+            return
+        self.top_10_handles = {
+            row["handle"]: 0.10 for row in _seed_trader_profiles()
+        }
+
+        url = f"{self.settings.geckoterminal_base_url.rstrip('/')}{GECKOTERMINAL_TRENDING_POOLS}"
+        try:
+            response = await client.get(
+                url,
+                headers={"Accept": "application/json;version=20230203"},
+                timeout=15.0,
+            )
+            response.raise_for_status()
+            body = response.json()
+        except httpx.HTTPError:
+            logger.exception("Could not fetch GeckoTerminal trending pools for keyless fallback.")
+            return
+        except ValueError:
+            logger.exception("GeckoTerminal returned invalid JSON for keyless fallback.")
+            return
+        pools = body.get("data", []) if isinstance(body, dict) else None
+        if not isinstance(pools, list):
+            raise ValueError("GeckoTerminal trending pools response is not a list")
+
+        profiles = _seed_trader_profiles()
+        handles = list(self.top_10_handles)
+        for index, pool in enumerate(pools[:10]):
+            if not isinstance(pool, dict):
+                continue
+            attributes = pool.get("attributes")
+            attributes = attributes if isinstance(attributes, dict) else {}
+            token = attributes.get("base_token_address") or attributes.get("token_address")
+            if not token:
+                relationships = pool.get("relationships")
+                base_token = (
+                    relationships.get("base_token", {}).get("data")
+                    if isinstance(relationships, dict)
+                    and isinstance(relationships.get("base_token"), dict)
+                    else None
+                )
+                if isinstance(base_token, dict):
+                    token = str(base_token.get("id") or "")
+                    if token.startswith("solana_"):
+                        token = token[len("solana_"):]
+            if not token:
+                logger.warning("Skipping GeckoTerminal trending pool without a base-token address.")
+                continue
+
+            handle = handles[index % len(handles)] if handles else profiles[index]["handle"]
+            weight = self.top_10_handles.get(handle, 0.10)
+            pool_id = str(attributes.get("address") or pool.get("id") or token)
+            trade_id = f"gecko-trending:solana:{pool_id}:{token}"
+            if trade_id in self._seen_trades:
+                continue
+            await on_signal(handle, "solana", str(token), "BUY", weight)
+            self._seen_trades.add(trade_id)
 
     def load_cached_top_10(self) -> dict[str, float]:
         with cursor_scope(self.con) as cur:
@@ -74,6 +174,9 @@ class FomoLeaderboardClient:
     async def fetch_leaderboard(self, client: httpx.AsyncClient, window: str) -> list[dict[str, Any]]:
         if window not in {"24h", "7d"}:
             raise ValueError(f"unsupported leaderboard window: {window}")
+        if not self._has_fomo_api_key():
+            self._warn_keyless_fallback("missing")
+            return _seed_trader_profiles()
         cache_key = f"leaderboard:{window}"
         response = await client.get(
             f"{self.base_url}/v1/fomo/leaderboard/{window}",
@@ -84,6 +187,9 @@ class FomoLeaderboardClient:
             if cache_key not in self._payloads:
                 raise RuntimeError(f"FOMO returned 304 without a cached {window} leaderboard")
             return self._payloads[cache_key]
+        if response.status_code in {401, 403}:
+            self._warn_keyless_fallback(response.status_code)
+            return _seed_trader_profiles()
         response.raise_for_status()
         etag = response.headers.get("ETag")
         if etag:
@@ -277,12 +383,23 @@ class FomoLeaderboardClient:
     async def poll_trader_positions_fallback(
         self, client: httpx.AsyncClient, on_signal: TradeCallback
     ) -> None:
+        if not self._has_fomo_api_key():
+            self._warn_keyless_fallback("missing")
+            await self._poll_geckoterminal_trending(client, on_signal)
+            return
         for handle, weight in tuple(self.top_10_handles.items()):
             cursor: str | None = None
             seen_cursors: set[str] = set()
             while True:
                 try:
                     body = await self._fetch_positions_page(client, handle, cursor)
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code in {401, 403}:
+                        self._warn_keyless_fallback(exc.response.status_code)
+                        await self._poll_geckoterminal_trending(client, on_signal)
+                        return
+                    logger.exception("Could not poll FOMO positions for %s", handle)
+                    break
                 except httpx.HTTPError:
                     logger.exception("Could not poll FOMO positions for %s", handle)
                     break
@@ -324,6 +441,18 @@ class FomoLeaderboardClient:
     async def stream_top_10_trades(
         self, client: httpx.AsyncClient, on_signal: TradeCallback, stop_event: asyncio.Event
     ) -> None:
+        if not self._has_fomo_api_key():
+            while not stop_event.is_set():
+                self._warn_keyless_fallback("missing")
+                try:
+                    await self._poll_geckoterminal_trending(client, on_signal)
+                except httpx.HTTPError:
+                    logger.exception("Could not poll GeckoTerminal trending pools.")
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=60)
+                except asyncio.TimeoutError:
+                    pass
+            return
         backoff = 2.0
         while not stop_event.is_set():
             headers = {}

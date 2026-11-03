@@ -7,7 +7,10 @@ import httpx
 import pytest
 
 from src.config import Settings
-from src.execution.gatekeeper import ExecutionGatekeeper
+from src.execution.gatekeeper import (
+    ExecutionGatekeeper,
+    passes_memecoin_microstructure_gates,
+)
 from src.execution.routers import (
     DirectOnChainRouter,
     DryRunRouter,
@@ -852,7 +855,7 @@ async def test_fomo_positions_etag_is_cached_per_page(db):
 
 @pytest.mark.asyncio
 async def test_fomo_rest_fallback_preserves_explicit_sell_side(db, monkeypatch):
-    fomo = FomoLeaderboardClient(db, Settings())
+    fomo = FomoLeaderboardClient(db, Settings(fomo_api_key="test-key"))
     fomo.top_10_handles = {"trader": 0.1}
 
     async def positions_page(
@@ -874,6 +877,231 @@ async def test_fomo_rest_fallback_preserves_explicit_sell_side(db, monkeypatch):
         await fomo.poll_trader_positions_fallback(client, capture)
 
     assert signals == [("trader", "solana", "Token", "SELL", 0.1)]
+
+
+@pytest.mark.parametrize(
+    "api_key",
+    ["", "your_pumpfomo_or_fomoradar_api_key_here"],
+)
+@pytest.mark.asyncio
+async def test_fomo_leaderboard_uses_keyless_seed_without_request(db, api_key):
+    fomo = FomoLeaderboardClient(db, Settings(fomo_api_key=api_key))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"unexpected FOMO request: {request.url}")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        rows = await fomo.fetch_leaderboard(client, "24h")
+
+    assert len(rows) == 10
+    assert [row["rank"] for row in rows] == list(range(1, 11))
+    assert all(row["is_demo"] and not row["verified"] for row in rows)
+    assert {row["chain"] for row in rows} == {"solana", "base"}
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+@pytest.mark.asyncio
+async def test_fomo_leaderboard_uses_keyless_seed_after_unauthorized_response(db, status_code):
+    fomo = FomoLeaderboardClient(db, Settings(fomo_api_key="test-key"))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        rows = await fomo.fetch_leaderboard(client, "24h")
+
+    assert len(rows) == 10
+    assert rows[0]["handle"] == "keyless_demo_01"
+
+
+@pytest.mark.asyncio
+async def test_keyless_fallback_maps_gecko_trending_pools_to_demo_traders(db):
+    requests: list[httpx.Request] = []
+    pools = [
+        {
+            "id": f"solana_pool_{index}",
+            "attributes": {"address": f"pool-{index}"},
+            "relationships": {
+                "base_token": {"data": {"id": f"solana_token-{index}"}}
+            },
+        }
+        for index in range(2)
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if "trending_pools" in str(request.url):
+            return httpx.Response(200, json={"data": pools}, request=request)
+        return httpx.Response(403, request=request)
+
+    fomo = FomoLeaderboardClient(db, Settings(fomo_api_key="test-key"))
+    fomo.top_10_handles = {"existing_trader": 0.1}
+    signals: list[tuple[str, str, str, str, float]] = []
+
+    async def capture(*signal: Any) -> str:
+        signals.append(signal)
+        return "accepted"
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await fomo.poll_trader_positions_fallback(client, capture)
+
+    assert [signal[:4] for signal in signals] == [
+        ("keyless_demo_01", "solana", "token-0", "BUY"),
+        ("keyless_demo_02", "solana", "token-1", "BUY"),
+    ]
+    assert all(signal[4] == 0.1 for signal in signals)
+    gecko_request = next(request for request in requests if "trending_pools" in str(request.url))
+    assert gecko_request.headers["Accept"] == "application/json;version=20230203"
+
+
+@pytest.mark.asyncio
+async def test_missing_fomo_key_polls_gecko_trending_pools_directly(db):
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "attributes": {"address": "pool-1", "base_token_address": "mint-1"}
+                    }
+                ]
+            },
+            request=request,
+        )
+
+    fomo = FomoLeaderboardClient(db, Settings(fomo_api_key=""))
+    signals: list[tuple[Any, ...]] = []
+
+    async def capture(*signal: Any) -> str:
+        signals.append(signal)
+        return "accepted"
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await fomo.poll_trader_positions_fallback(client, capture)
+
+    assert len(requests) == 1
+    assert "trending_pools" in str(requests[0].url)
+    assert signals == [("keyless_demo_01", "solana", "mint-1", "BUY", 0.1)]
+
+
+@pytest.mark.asyncio
+async def test_keyless_gecko_signal_fallback_is_disabled_outside_dry_run(db):
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"unexpected keyless fallback request: {request.url}")
+
+    fomo = FomoLeaderboardClient(db, Settings(fomo_api_key="", dry_run=False))
+    signals: list[tuple[Any, ...]] = []
+
+    async def capture(*signal: Any) -> str:
+        signals.append(signal)
+        return "accepted"
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await fomo.poll_trader_positions_fallback(client, capture)
+
+    assert signals == []
+
+
+def test_microstructure_rejects_migration_fdv_and_low_turnover():
+    rejected_fdv = passes_memecoin_microstructure_gates(
+        {"fdv_usd": 50_000, "volume_usd_h24": 100_000, "reserve_in_usd": 50_000}
+    )
+    rejected_volume = passes_memecoin_microstructure_gates(
+        {"fdv_usd": 200_000, "volume_24h_usd": 50_000, "liquidity_usd": 50_000}
+    )
+
+    assert rejected_fdv[0] is False
+    assert "pre-migration" in rejected_fdv[1]
+    assert rejected_volume[0] is False
+    assert "Weak Volume/FDV" in rejected_volume[1]
+
+
+def test_microstructure_rejects_stair_step_patterns_and_green_spikes():
+    import pandas as pd
+
+    stair_step = pd.DataFrame(
+        {
+            "open": [1.0 + index * 0.001 for index in range(12)],
+            "close": [1.001 + index * 0.001 for index in range(12)],
+        }
+    )
+    spike = pd.DataFrame(
+        {
+            "open": [1.0 + (index % 2) * 0.03 for index in range(12)],
+            "close": [0.98 + (index % 3) * 0.02 for index in range(11)] + [1.10],
+        }
+    )
+    accepted_pullback = pd.DataFrame(
+        {
+            "open": [1.0 + index * 0.01 for index in range(12)],
+            "close": [0.99 + index * 0.01 for index in range(11)] + [1.10],
+        }
+    )
+
+    assert "stair-step" in passes_memecoin_microstructure_gates({}, stair_step)[1]
+    assert "chase" in passes_memecoin_microstructure_gates({}, spike)[1]
+    assert passes_memecoin_microstructure_gates({}, accepted_pullback)[0] is True
+
+
+@pytest.mark.asyncio
+async def test_microstructure_rejection_is_persisted_and_alerted(db, market, monkeypatch):
+    scanner = StubScanner(
+        {
+            **market,
+            "fdv_usd": 50_000,
+            "volume_usd_h24": 100_000,
+        }
+    )
+    alerts: list[tuple[str, str]] = []
+
+    async def record_alert(message: str, severity: str) -> None:
+        alerts.append((message, severity))
+
+    monkeypatch.setattr("src.execution.gatekeeper.send_alert", record_alert)
+    gatekeeper = ExecutionGatekeeper(
+        db, scanner, DryRunRouter(), Settings(starting_bankroll_usd=10_000)
+    )
+    async with httpx.AsyncClient() as client:
+        result = await gatekeeper.process_copy_signal(
+            client, "trader", "solana", "MigrationZoneToken", "BUY", 0.1
+        )
+
+    assert result.startswith("REJECTED:Rejected: Token in pre-migration")
+    assert alerts and alerts[0][1] == "WARNING"
+    assert db.execute(
+        "SELECT status, failure_reason FROM execution_orders"
+    ).fetchone() == ("REJECTED", result.removeprefix("REJECTED:"))
+
+
+@pytest.mark.asyncio
+async def test_gatekeeper_normalizes_volume_and_liquidity_aliases(db, market, monkeypatch):
+    scanner = StubScanner(
+        {
+            **market,
+            "fdv_usd": 100_000,
+            "volume_usd_h24": None,
+            "volume_24h_usd": 20_000,
+            "reserve_in_usd": None,
+            "liquidity_usd": 50_000,
+        }
+    )
+
+    async def record_alert(message: str, severity: str) -> None:
+        return None
+
+    monkeypatch.setattr("src.execution.gatekeeper.send_alert", record_alert)
+    gatekeeper = ExecutionGatekeeper(
+        db, scanner, DryRunRouter(), Settings(starting_bankroll_usd=10_000)
+    )
+    async with httpx.AsyncClient() as client:
+        result = await gatekeeper.process_copy_signal(
+            client, "trader", "solana", "LowTurnoverToken", "BUY", 0.1
+        )
+
+    assert result.startswith("REJECTED:Rejected: Weak Volume/FDV turnover")
 
 
 @pytest.mark.asyncio
