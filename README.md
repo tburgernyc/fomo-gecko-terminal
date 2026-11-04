@@ -1,9 +1,12 @@
 # fomo-gecko-terminal
 
-When `FOMO_API_KEY` is missing or unauthorized, dry-run mode uses clearly labeled
-synthetic demo trader profiles and polls GeckoTerminal's public Solana trending
-pools. These profiles are not verified real traders and have no wallet addresses;
-keyless trending-pool signals are disabled when `DRY_RUN=false`.
+In dry-run mode, a missing/unauthorized FOMO key or network outage uses clearly
+labeled synthetic demo trader profiles; with no key configured it also polls
+GeckoTerminal's public Solana trending pools. These profiles are not verified real
+traders and have no wallet addresses. Live mode requires an authorized
+`FOMO_API_KEY` and fails closed on missing/unauthorized credentials or network
+errors. FOMO leaderboard JSON envelopes are unwrapped only for known list-bearing
+keys, and invalid payload or row shapes are reported explicitly.
 
 BUY signals also pass FDV/volume, migration-zone, and recent-candle
 microstructure checks in addition to the existing liquidity and RSI gates.

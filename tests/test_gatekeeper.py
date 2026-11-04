@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 import time
 from typing import Any
@@ -980,6 +981,85 @@ async def test_fomo_leaderboard_uses_keyless_seed_without_request(db, api_key):
     assert {row["chain"] for row in rows} == {"solana", "base"}
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"data": [{"handle": "wrapped-data"}]},
+        {"result": {"items": [{"handle": "wrapped-items"}]}},
+        {"traders": [{"handle": "wrapped-traders"}]},
+        {"leaderboard": [{"handle": "wrapped-leaderboard"}]},
+        {"success": True, "topTraders": {"24h": [{"handle": "wrapped-top-traders"}]}},
+        {"data": {"top_traders_24h": [{"handle": "wrapped-period"}]}},
+    ],
+)
+@pytest.mark.asyncio
+async def test_fomo_leaderboard_unwraps_known_response_envelopes(db, payload):
+    fomo = FomoLeaderboardClient(db, Settings(fomo_api_key="test-key"))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        rows = await fomo.fetch_leaderboard(client, "24h")
+
+    assert len(rows) == 1
+    assert rows[0]["handle"].startswith("wrapped-")
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"error": "temporarily unavailable"}, "unexpected dictionary format.*error:str"),
+        ({"data": [{"handle": "valid"}, "invalid-row"]}, "row 1 is not an object"),
+        ({"data": None}, "unexpected dictionary format"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_fomo_leaderboard_rejects_malformed_payloads(db, payload, message):
+    fomo = FomoLeaderboardClient(db, Settings(fomo_api_key="test-key"))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(ValueError, match=message):
+            await fomo.fetch_leaderboard(client, "24h")
+
+
+@pytest.mark.asyncio
+async def test_offline_fomo_leaderboard_uses_demo_seed_only_in_dry_run(db, monkeypatch):
+    from tenacity import wait_none
+
+    monkeypatch.setattr(
+        FomoLeaderboardClient._request_leaderboard.retry, "wait", wait_none()
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("offline", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        dry_run_fomo = FomoLeaderboardClient(
+            db, Settings(fomo_api_key="test-key", dry_run=True)
+        )
+        rows = await dry_run_fomo.fetch_leaderboard(client, "24h")
+        live_fomo = FomoLeaderboardClient(
+            db, Settings(fomo_api_key="test-key", dry_run=False)
+        )
+        with pytest.raises(httpx.ConnectError, match="offline"):
+            await live_fomo.fetch_leaderboard(client, "24h")
+
+    assert len(rows) == 10
+    assert all(row["is_demo"] is True for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_live_fomo_leaderboard_requires_api_key(db):
+    fomo = FomoLeaderboardClient(db, Settings(fomo_api_key="", dry_run=False))
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(RuntimeError, match="FOMO_API_KEY is required"):
+            await fomo.fetch_leaderboard(client, "24h")
+
+
 @pytest.mark.parametrize("status_code", [401, 403])
 @pytest.mark.asyncio
 async def test_fomo_leaderboard_uses_keyless_seed_after_unauthorized_response(db, status_code):
@@ -993,6 +1073,21 @@ async def test_fomo_leaderboard_uses_keyless_seed_after_unauthorized_response(db
 
     assert len(rows) == 10
     assert rows[0]["handle"] == "keyless_demo_01"
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+@pytest.mark.asyncio
+async def test_live_fomo_leaderboard_rejects_unauthorized_credentials(db, status_code):
+    fomo = FomoLeaderboardClient(
+        db, Settings(fomo_api_key="test-key", dry_run=False)
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(RuntimeError, match=f"HTTP {status_code}"):
+            await fomo.fetch_leaderboard(client, "24h")
 
 
 @pytest.mark.asyncio
@@ -1131,9 +1226,24 @@ async def test_keyless_gecko_signal_fallback_is_disabled_outside_dry_run(db):
         return "accepted"
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        await fomo.poll_trader_positions_fallback(client, capture)
+        with pytest.raises(RuntimeError, match="FOMO_API_KEY is required"):
+            await fomo.poll_trader_positions_fallback(client, capture)
 
     assert signals == []
+
+
+@pytest.mark.asyncio
+async def test_live_fomo_trade_stream_requires_api_key(db):
+    fomo = FomoLeaderboardClient(db, Settings(fomo_api_key="", dry_run=False))
+
+    async def capture(*signal: Any) -> str:
+        return "unused"
+
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(RuntimeError, match="FOMO_API_KEY is required"):
+            await fomo.stream_top_10_trades(
+                client, capture, asyncio.Event()
+            )
 
 
 def test_microstructure_rejects_migration_fdv_and_low_turnover():

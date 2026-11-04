@@ -99,6 +99,62 @@ class FomoLeaderboardClient:
         return bool(api_key and api_key.lower() != FOMO_API_KEY_PLACEHOLDER)
 
     @staticmethod
+    def _unwrap_leaderboard_rows(body: Any, window: str) -> list[dict[str, Any]]:
+        """Unwrap known API envelopes and validate every leaderboard row."""
+        window_key = window.lower()
+        window_label = "24" if window_key == "24h" else "7"
+        wrapper_keys = (
+            "data",
+            "result",
+            "items",
+            "traders",
+            "leaderboard",
+            "topTraders",
+            "top_traders",
+            "topTraders24h" if window_key == "24h" else "topTraders7d",
+            "top_traders_24h" if window_key == "24h" else "top_traders_7d",
+            "results",
+            "rows",
+            "users",
+            "entries",
+            "payload",
+            window_key,
+            window_key.upper(),
+            window_label,
+        )
+        payload = body
+        while isinstance(payload, dict):
+            wrapped = False
+            for key in wrapper_keys:
+                candidate = payload.get(key)
+                if isinstance(candidate, (dict, list)):
+                    payload = candidate
+                    wrapped = True
+                    break
+            if not wrapped:
+                shape = ", ".join(
+                    f"{key}:{type(value).__name__}"
+                    for key, value in sorted(payload.items(), key=lambda item: str(item[0]))
+                )
+                raise ValueError(
+                    f"FOMO {window} leaderboard returned an unexpected dictionary "
+                    f"format; top-level structure: {{{shape}}}. Expected a list or a "
+                    "recognized list-bearing envelope."
+                )
+        if not isinstance(payload, list):
+            raise ValueError(
+                f"FOMO {window} leaderboard response is not a list "
+                f"(got {type(payload).__name__})"
+            )
+        for index, row in enumerate(payload):
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"FOMO {window} leaderboard row {index} is not an object "
+                    f"(got {type(row).__name__})"
+                )
+        return payload
+
+    @staticmethod
     def _warn_keyless_fallback(status_code: int | str) -> None:
         logger.warning(
             "FOMO API key missing or unauthorized (HTTP %s); activating keyless GeckoTerminal V2 fallback mode.",
@@ -188,39 +244,65 @@ class FomoLeaderboardClient:
         wait=wait_exponential(multiplier=1, min=1, max=12),
         reraise=True,
     )
-    async def fetch_leaderboard(self, client: httpx.AsyncClient, window: str) -> list[dict[str, Any]]:
+    async def _request_leaderboard(
+        self, client: httpx.AsyncClient, window: str, cache_key: str
+    ) -> httpx.Response:
+        response = await client.get(
+            f"{self.base_url}/v1/fomo/leaderboard/{window}",
+            headers=self._headers(cache_key),
+            timeout=15.0,
+        )
+        if response.status_code != 304:
+            response.raise_for_status()
+        return response
+
+    async def fetch_leaderboard(
+        self, client: httpx.AsyncClient, window: str
+    ) -> list[dict[str, Any]]:
         if window not in {"24h", "7d"}:
             raise ValueError(f"unsupported leaderboard window: {window}")
         if not self._has_fomo_api_key():
+            if not self.settings.dry_run:
+                raise RuntimeError(
+                    "FOMO_API_KEY is required to fetch the live leaderboard; "
+                    "demo profiles are only available in dry-run mode."
+                )
             self._warn_keyless_fallback("missing")
             return _seed_trader_profiles()
         cache_key = f"leaderboard:{window}"
         try:
-            response = await client.get(
-                f"{self.base_url}/v1/fomo/leaderboard/{window}",
-                headers=self._headers(cache_key),
-                timeout=15.0,
-            )
-            if response.status_code == 304:
-                if cache_key not in self._payloads:
-                    raise RuntimeError(f"FOMO returned 304 without a cached {window} leaderboard")
-                return self._payloads[cache_key]
-            response.raise_for_status()
+            response = await self._request_leaderboard(client, window, cache_key)
         except httpx.HTTPStatusError as e:
             if e.response.status_code in {401, 403}:
+                if not self.settings.dry_run:
+                    raise RuntimeError(
+                        f"FOMO rejected live leaderboard credentials with HTTP "
+                        f"{e.response.status_code}; verify FOMO_API_KEY and API access."
+                    ) from e
                 self._warn_keyless_fallback(e.response.status_code)
                 return _seed_trader_profiles()
             raise
+        except (httpx.NetworkError, httpx.TimeoutException):
+            if not self.settings.dry_run:
+                raise
+            logger.warning(
+                "FOMO %s leaderboard is offline; using clearly labeled demo trader profiles "
+                "in dry-run mode.",
+                window,
+                exc_info=True,
+            )
+            return _seed_trader_profiles()
+        if response.status_code == 304:
+            if cache_key not in self._payloads:
+                raise RuntimeError(f"FOMO returned 304 without a cached {window} leaderboard")
+            return self._payloads[cache_key]
         etag = response.headers.get("ETag")
         if etag:
             self._etags[cache_key] = etag
         body = response.json()
-        rows = body.get("data", body) if isinstance(body, dict) else body
-        if not isinstance(rows, list):
-            raise ValueError(f"FOMO {window} leaderboard response is not a list")
-        normalized = [row for row in rows if isinstance(row, dict)]
-        self._payloads[cache_key] = normalized
-        return normalized
+        rows = self._unwrap_leaderboard_rows(body, window)
+        self._payloads[cache_key] = rows
+        return rows
 
     async def refresh_top_10_traders(self, client: httpx.AsyncClient) -> dict[str, float]:
         day, week = await asyncio.gather(
@@ -404,6 +486,11 @@ class FomoLeaderboardClient:
         self, client: httpx.AsyncClient, on_signal: TradeCallback
     ) -> None:
         if not self._has_fomo_api_key():
+            if not self.settings.dry_run:
+                raise RuntimeError(
+                    "FOMO_API_KEY is required to poll live trader positions; "
+                    "keyless GeckoTerminal fallback is dry-run only."
+                )
             self._warn_keyless_fallback("missing")
             await self._poll_geckoterminal_trending(client, on_signal)
             return
@@ -415,6 +502,11 @@ class FomoLeaderboardClient:
                     body = await self._fetch_positions_page(client, handle, cursor)
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code in {401, 403}:
+                        if not self.settings.dry_run:
+                            raise RuntimeError(
+                                f"FOMO rejected live position-poll credentials with HTTP "
+                                f"{e.response.status_code}; verify FOMO_API_KEY and API access."
+                            ) from e
                         self._warn_keyless_fallback(e.response.status_code)
                         await self._poll_geckoterminal_trending(client, on_signal)
                         return
@@ -467,6 +559,11 @@ class FomoLeaderboardClient:
         self, client: httpx.AsyncClient, on_signal: TradeCallback, stop_event: asyncio.Event
     ) -> None:
         if not self._has_fomo_api_key():
+            if not self.settings.dry_run:
+                raise RuntimeError(
+                    "FOMO_API_KEY is required for live trade streaming; "
+                    "keyless fallback is dry-run only."
+                )
             while not stop_event.is_set():
                 self._warn_keyless_fallback("missing")
                 try:
