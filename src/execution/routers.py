@@ -4,6 +4,8 @@ import hashlib
 import hmac
 import json
 import logging
+import random
+import struct
 import time
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -12,14 +14,104 @@ import httpx
 from eth_account import Account
 from solana.rpc.async_api import AsyncClient as SolanaAsyncClient
 from solana.rpc.models import TxOpts
+from solders.address_lookup_table_account import AddressLookupTable, AddressLookupTableAccount
+from solders.hash import Hash
+from solders.instruction import AccountMeta, Instruction
 from solders.keypair import Keypair
+from solders.message import MessageV0
+from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
+from solders.compute_budget import set_compute_unit_price
+from solders.system_program import TransferParams, transfer
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from src.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 SOLANA_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+JITO_TIP_ACCOUNTS = (
+    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+)
+JITO_DONT_FRONT_PUBKEY = "jitodontfront111111111111111111111111111111"
+JITO_MEMO_PROGRAM_ID = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+MIN_JITO_TIP_LAMPORTS = 1_000
+DEFAULT_SOLANA_FEE_BUDGET_LAMPORTS = 150_000
+
+
+def compute_fee_split(total_budget_lamports: int) -> tuple[int, int]:
+    if total_budget_lamports <= 0:
+        raise ValueError("fee budget must be positive")
+    priority_fee = int(total_budget_lamports * 0.70)
+    jito_tip = max(MIN_JITO_TIP_LAMPORTS, total_budget_lamports - priority_fee)
+    return priority_fee, jito_tip
+
+
+def select_jito_tip_account() -> str:
+    return random.choice(JITO_TIP_ACCOUNTS)
+
+
+def jitodontfront_instruction() -> Instruction:
+    return Instruction(
+        Pubkey.from_string(JITO_MEMO_PROGRAM_ID),
+        b"jitodontfront",
+        [AccountMeta(Pubkey.from_string(JITO_DONT_FRONT_PUBKEY), False, False)],
+    )
+
+
+def build_jupiter_swap_payload(
+    quote_response: dict[str, Any],
+    user_pubkey: str,
+    total_fee_budget_lamports: int = DEFAULT_SOLANA_FEE_BUDGET_LAMPORTS,
+) -> dict[str, Any]:
+    priority_fee_lamports, _ = compute_fee_split(total_fee_budget_lamports)
+    return {
+        "quoteResponse": quote_response,
+        "userPublicKey": user_pubkey,
+        "wrapAndUnwrapSol": True,
+        "dynamicComputeUnitLimit": True,
+        "dynamicSlippage": {"minBps": 50, "maxBps": 250},
+        "prioritizationFeeLamports": {
+            "priorityLevelWithMaxLamports": {
+                "priorityLevel": "veryHigh",
+                "maxLamports": priority_fee_lamports,
+            }
+        },
+    }
+
+
+def _jupiter_instruction(payload: dict[str, Any]) -> Instruction:
+    accounts = [
+        AccountMeta(
+            Pubkey.from_string(str(account["pubkey"])),
+            bool(account.get("isSigner", False)),
+            bool(account.get("isWritable", False)),
+        )
+        for account in payload.get("accounts", [])
+    ]
+    return Instruction(
+        Pubkey.from_string(str(payload["programId"])),
+        base64.b64decode(payload["data"]),
+        accounts,
+    )
+
+
+def _compute_unit_limit(instructions: list[Instruction]) -> int:
+    for instruction in instructions:
+        data = bytes(instruction.data)
+        if (
+            str(instruction.program_id) == "ComputeBudget111111111111111111111111111111"
+            and len(data) >= 5
+            and data[0] == 2
+        ):
+            return struct.unpack_from("<I", data, 1)[0]
+    return 1_400_000
 BASE_USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 EVM_NETWORKS = {
     "base": (8453, BASE_USDC, "base_rpc_url"),
@@ -316,6 +408,20 @@ class DirectOnChainRouter:
             raise ValueError("swap quote response must be an object")
         return body
 
+    @retry(
+        retry=retry_if_exception(_retryable),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=6),
+        reraise=True,
+    )
+    async def _post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        response = await self.client.post(url, json=payload, timeout=20)
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict):
+            raise ValueError("swap instruction response must be an object")
+        return body
+
     async def _submit_solana(self, intent: OrderIntent) -> ExecutionResult:
         private_key = self.settings.solana_private_key.get_secret_value()
         if not private_key:
@@ -338,35 +444,134 @@ class DirectOnChainRouter:
             f"{base_url}/quote?inputMint={input_mint}&outputMint={output_mint}"
             f"&amount={amount}&slippageBps=100"
         )
-        swap = await self._post_json(
-            f"{base_url}/swap",
-            {
-                "quoteResponse": quote,
-                "userPublicKey": str(wallet.pubkey()),
-                "wrapAndUnwrapSol": True,
-                "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": "auto",
-            },
+        fee_budget = self.settings.solana_fee_budget_lamports
+        priority_fee_lamports, jito_tip_lamports = compute_fee_split(fee_budget)
+        swap_instructions = await self._post_json(
+            f"{base_url}/swap-instructions",
+            build_jupiter_swap_payload(quote, str(wallet.pubkey()), fee_budget),
         )
-        if not swap.get("swapTransaction"):
-            raise ValueError("Jupiter did not return a swap transaction")
-        unsigned = VersionedTransaction.from_bytes(base64.b64decode(swap["swapTransaction"]))
-        signed = VersionedTransaction.populate(unsigned.message, [wallet])
+        compute_instructions = [
+            _jupiter_instruction(instruction)
+            for instruction in swap_instructions.get("computeBudgetInstructions", [])
+        ]
+        compute_unit_limit = _compute_unit_limit(compute_instructions)
+        compute_instructions = [
+            instruction for instruction in compute_instructions
+            if not (
+                str(instruction.program_id) == "ComputeBudget111111111111111111111111111111"
+                and bytes(instruction.data)[:1] == b"\x03"
+            )
+        ]
+        compute_instructions.append(
+            set_compute_unit_price(
+                priority_fee_lamports * 1_000_000 // compute_unit_limit
+            )
+        )
+        instructions = compute_instructions + [
+            _jupiter_instruction(instruction)
+            for instruction in swap_instructions.get("setupInstructions", [])
+        ]
+        if token_ledger_instruction := swap_instructions.get("tokenLedgerInstruction"):
+            instructions.append(_jupiter_instruction(token_ledger_instruction))
+        swap_instruction = swap_instructions.get("swapInstruction")
+        if not isinstance(swap_instruction, dict):
+            raise ValueError("Jupiter did not return a swap instruction")
+        instructions.append(_jupiter_instruction(swap_instruction))
+        if cleanup_instruction := swap_instructions.get("cleanupInstruction"):
+            instructions.append(_jupiter_instruction(cleanup_instruction))
+        instructions.extend(
+            _jupiter_instruction(instruction)
+            for instruction in swap_instructions.get("otherInstructions", [])
+        )
+        instructions.append(jitodontfront_instruction())
+        instructions.append(
+            transfer(
+                TransferParams(
+                    from_pubkey=wallet.pubkey(),
+                    to_pubkey=Pubkey.from_string(select_jito_tip_account()),
+                    lamports=jito_tip_lamports,
+                )
+            )
+        )
+        lookup_tables = await self._solana_address_lookup_tables(
+            swap_instructions.get("addressLookupTableAddresses", [])
+        )
+        latest_blockhash = await self._solana_rpc(
+            "getLatestBlockhash", [{"commitment": "processed"}]
+        )
+        blockhash = (
+            latest_blockhash.get("value", {}).get("blockhash")
+            if isinstance(latest_blockhash, dict)
+            else None
+        )
+        if not blockhash:
+            raise ValueError("Solana RPC returned no recent blockhash")
+        message = MessageV0.try_compile(
+            wallet.pubkey(),
+            instructions,
+            lookup_tables,
+            Hash.from_string(blockhash),
+        )
+        signed = VersionedTransaction(message, [wallet])
         signature = str(signed.signatures[0])
         out_amount = int(quote.get("outAmount") or 0)
         out_mint = output_mint if is_buy else input_mint
         decimals = await self._solana_token_decimals(out_mint)
         try:
-            await self._send_solana_transaction(bytes(signed))
+            bundle_id = await self._send_jito_bundle(bytes(signed))
         except Exception as exc:
-            raise SubmissionUncertain(f"Solana transaction broadcast outcome is unknown: {exc}", signature) from exc
+            raise SubmissionUncertain(
+                f"Jito bundle submission outcome is unknown: {exc}", signature
+            ) from exc
         filled_tokens = out_amount / (10**decimals) if is_buy else amount / (10**decimals)
         return ExecutionResult(
             "SUBMITTED",
             filled_usd=intent.notional_usd,
             filled_token_amount=filled_tokens,
             tx_id=signature,
+            detail=(
+                f"jito_bundle_id={bundle_id};priority_fee_lamports={priority_fee_lamports};"
+                f"jito_tip_lamports={jito_tip_lamports}"
+            ),
         )
+
+    async def _solana_address_lookup_tables(
+        self, addresses: list[str]
+    ) -> list[AddressLookupTableAccount]:
+        lookup_tables: list[AddressLookupTableAccount] = []
+        for address in addresses:
+            account = await self._solana_rpc(
+                "getAccountInfo", [address, {"encoding": "base64"}]
+            )
+            value = account.get("value") if isinstance(account, dict) else None
+            data = value.get("data") if isinstance(value, dict) else None
+            if not isinstance(data, list) or not data or not isinstance(data[0], str):
+                raise ValueError(f"Solana RPC returned no address lookup table data for {address}")
+            table = AddressLookupTable.deserialize(base64.b64decode(data[0]))
+            lookup_tables.append(
+                AddressLookupTableAccount(Pubkey.from_string(address), table.addresses)
+            )
+        return lookup_tables
+
+    async def _send_jito_bundle(self, signed_transaction: bytes) -> str:
+        response = await self.client.post(
+            self.settings.jito_block_engine_url,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "sendBundle",
+                "params": [[base64.b64encode(signed_transaction).decode("ascii")], {"encoding": "base64"}],
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict) or body.get("error"):
+            raise RuntimeError(f"Jito rejected bundle submission: {body}")
+        bundle_id = body.get("result")
+        if not isinstance(bundle_id, str) or not bundle_id:
+            raise ValueError("Jito returned no bundle ID")
+        return bundle_id
 
     async def _solana_rpc(self, method: str, params: list[Any]) -> Any:
         return await self._solana_rpc_request(method, params)

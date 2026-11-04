@@ -26,6 +26,9 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
     price_usd DOUBLE,
     reserve_in_usd DOUBLE,
     volume_24h_usd DOUBLE,
+    fdv_usd DOUBLE,
+    buys_m5 INTEGER NOT NULL DEFAULT 0,
+    sells_m5 INTEGER NOT NULL DEFAULT 0,
     rsi_14 DOUBLE,
     macd_hist DOUBLE,
     atr_14 DOUBLE,
@@ -73,14 +76,33 @@ CREATE TABLE IF NOT EXISTS execution_orders (
     entry_price_usd DOUBLE,
     exit_price_usd DOUBLE,
     high_water_price_usd DOUBLE,
+    entry_atr_usd DOUBLE,
+    exit_campaign_id VARCHAR,
+    exit_tranche VARCHAR,
+    tranche_1_sold_amount DOUBLE NOT NULL DEFAULT 0,
+    tranche_2_sold_amount DOUBLE NOT NULL DEFAULT 0,
     fee_usd DOUBLE NOT NULL DEFAULT 0,
     realized_pnl_usd DOUBLE NOT NULL DEFAULT 0,
     unrealized_pnl_usd DOUBLE NOT NULL DEFAULT 0,
     tx_hash_or_exchange_id VARCHAR,
+    execution_detail VARCHAR,
     failure_reason VARCHAR,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS fdv_usd DOUBLE;
+ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS buys_m5 INTEGER DEFAULT 0;
+ALTER TABLE market_snapshots ADD COLUMN IF NOT EXISTS sells_m5 INTEGER DEFAULT 0;
+ALTER TABLE execution_orders ADD COLUMN IF NOT EXISTS entry_atr_usd DOUBLE;
+ALTER TABLE execution_orders ADD COLUMN IF NOT EXISTS exit_campaign_id VARCHAR;
+ALTER TABLE execution_orders ADD COLUMN IF NOT EXISTS exit_tranche VARCHAR;
+ALTER TABLE execution_orders ADD COLUMN IF NOT EXISTS tranche_1_sold_amount DOUBLE DEFAULT 0;
+ALTER TABLE execution_orders ADD COLUMN IF NOT EXISTS tranche_2_sold_amount DOUBLE DEFAULT 0;
+ALTER TABLE execution_orders ADD COLUMN IF NOT EXISTS execution_detail VARCHAR;
+UPDATE execution_orders
+SET exit_campaign_id = client_order_id
+WHERE side = 'BUY' AND exit_campaign_id IS NULL;
 
 CREATE TABLE IF NOT EXISTS equity_snapshots (
     ts TIMESTAMP PRIMARY KEY,

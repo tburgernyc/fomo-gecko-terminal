@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote
 
@@ -14,7 +15,7 @@ from src.db import cursor_scope, transaction_scope
 from src.quant.allocator import PortfolioAllocator
 
 logger = logging.getLogger(__name__)
-TradeCallback = Callable[[str, str, str, str, float], Awaitable[str]]
+TradeCallback = Callable[..., Awaitable[str]]
 FOMO_API_KEY_PLACEHOLDER = "your_pumpfomo_or_fomoradar_api_key_here"
 GECKOTERMINAL_TRENDING_POOLS = "/networks/solana/trending_pools"
 
@@ -65,6 +66,22 @@ class FomoLeaderboardClient:
             if name in row and row[name] is not None:
                 return row[name]
         return default
+
+    @classmethod
+    def _leader_entry_price(cls, row: dict[str, Any]) -> float | None:
+        value = cls._field(
+            row, "priceUsd", "price_usd", "entryPrice", "entry_price",
+            "executionPrice", "execution_price", "fillPrice", "fill_price", "price",
+        )
+        if value is None:
+            return None
+        try:
+            price = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("leader fill price must be numeric") from exc
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError("leader fill price must be finite and positive")
+        return price
 
     def _headers(self, cache_key: str) -> dict[str, str]:
         headers = {"Accept": "application/json", "User-Agent": "FomoGeckoTerminal/1.0"}
@@ -178,19 +195,22 @@ class FomoLeaderboardClient:
             self._warn_keyless_fallback("missing")
             return _seed_trader_profiles()
         cache_key = f"leaderboard:{window}"
-        response = await client.get(
-            f"{self.base_url}/v1/fomo/leaderboard/{window}",
-            headers=self._headers(cache_key),
-            timeout=15.0,
-        )
-        if response.status_code == 304:
-            if cache_key not in self._payloads:
-                raise RuntimeError(f"FOMO returned 304 without a cached {window} leaderboard")
-            return self._payloads[cache_key]
-        if response.status_code in {401, 403}:
-            self._warn_keyless_fallback(response.status_code)
-            return _seed_trader_profiles()
-        response.raise_for_status()
+        try:
+            response = await client.get(
+                f"{self.base_url}/v1/fomo/leaderboard/{window}",
+                headers=self._headers(cache_key),
+                timeout=15.0,
+            )
+            if response.status_code == 304:
+                if cache_key not in self._payloads:
+                    raise RuntimeError(f"FOMO returned 304 without a cached {window} leaderboard")
+                return self._payloads[cache_key]
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in {401, 403}:
+                self._warn_keyless_fallback(e.response.status_code)
+                return _seed_trader_profiles()
+            raise
         etag = response.headers.get("ETag")
         if etag:
             self._etags[cache_key] = etag
@@ -393,9 +413,9 @@ class FomoLeaderboardClient:
             while True:
                 try:
                     body = await self._fetch_positions_page(client, handle, cursor)
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code in {401, 403}:
-                        self._warn_keyless_fallback(exc.response.status_code)
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code in {401, 403}:
+                        self._warn_keyless_fallback(e.response.status_code)
                         await self._poll_geckoterminal_trending(client, on_signal)
                         return
                     logger.exception("Could not poll FOMO positions for %s", handle)
@@ -424,7 +444,12 @@ class FomoLeaderboardClient:
                     if side not in {"BUY", "SELL"}:
                         amount = float(self._field(row, "amount", "quantity", default=1.0))
                         side = "SELL" if amount <= 0 else "BUY"
-                    await on_signal(handle, network, token, side, weight)
+                    signal = (handle, network, token, side, weight)
+                    leader_entry_price = self._leader_entry_price(row)
+                    await on_signal(
+                        *signal,
+                        *([leader_entry_price] if leader_entry_price is not None else []),
+                    )
                     self._seen_trades.add(trade_id)
                 page = body.get("pagination", {})
                 next_cursor = (
@@ -477,12 +502,17 @@ class FomoLeaderboardClient:
                         side = str(event.get("side") or "BUY").upper()
                         if handle not in self.top_10_handles or not token or side not in {"BUY", "SELL"}:
                             continue
-                        result = await on_signal(
+                        signal = (
                             handle,
                             str(event.get("network") or event.get("chain") or "solana"),
                             token,
                             side,
                             self.top_10_handles[handle],
+                        )
+                        leader_entry_price = self._leader_entry_price(event)
+                        result = await on_signal(
+                            *signal,
+                            *([leader_entry_price] if leader_entry_price is not None else []),
                         )
                         logger.info("FOMO signal %s %s -> %s", handle, side, result)
             except (

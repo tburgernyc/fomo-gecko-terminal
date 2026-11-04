@@ -19,11 +19,12 @@ class Settings(BaseSettings):
     max_single_ticket_pct: float = 0.06
     max_pool_liquidity_impact_pct: float = 0.02
     execution_router: str = "onchain"
-    min_pool_liquidity_usd: float = 12000.0
+    min_pool_liquidity_usd: float = 25000.0
     min_pool_volume_24h_usd: float = 40000.0
     max_entry_rsi_14: float = 78.0
     consensus_window_seconds: int = 600
     time_stop_minutes: int = 90
+    exit_time_stop_minutes: int = 12
     trailing_stop_pct: float = 0.12
 
     duckdb_path: str = "fomo_gecko_terminal.duckdb"
@@ -40,6 +41,8 @@ class Settings(BaseSettings):
     base_rpc_url: str = "https://mainnet.base.org"
     bnb_rpc_url: str = "https://bsc-rpc.publicnode.com"
     jupiter_base_url: str = "https://quote-api.jup.ag/v6"
+    jito_block_engine_url: str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles"
+    solana_fee_budget_lamports: int = 150_000
     zerox_base_url: str = "https://api.0x.org"
     zerox_api_key: SecretStr = SecretStr("")
     freqtrade_webhook_url: str = ""
@@ -71,11 +74,18 @@ class Settings(BaseSettings):
             raise ValueError("RSI limit must be in [0, 100]")
         return value
 
-    @field_validator("consensus_window_seconds", "time_stop_minutes")
+    @field_validator("consensus_window_seconds", "time_stop_minutes", "exit_time_stop_minutes")
     @classmethod
     def validate_positive_integer(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("value must be positive")
+        return value
+
+    @field_validator("solana_fee_budget_lamports")
+    @classmethod
+    def validate_fee_budget(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("Solana fee budget must be positive")
         return value
 
     @field_validator("execution_router")

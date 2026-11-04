@@ -113,6 +113,10 @@ class GeckoTerminalScanner:
         volume = float((attributes.get("volume_usd") or {}).get("h24") or 0)
         price = float(attributes.get("base_token_price_usd") or 0)
         fdv = float(attributes.get("fdv_usd") or 0)
+        transactions = attributes.get("transactions") or {}
+        m5_transactions = transactions.get("m5") or {}
+        buys_m5 = int(m5_transactions.get("buys") or 0)
+        sells_m5 = int(m5_transactions.get("sells") or 0)
         result: dict[str, Any] = {
             "network": slug,
             "pool_address": pool_address,
@@ -121,6 +125,9 @@ class GeckoTerminalScanner:
             "volume_usd_h24": volume,
             "fdv_usd": fdv,
             "price_usd": price,
+            "buys_m5": buys_m5,
+            "sells_m5": sells_m5,
+            "order_flow_ratio": buys_m5 / max(1, sells_m5),
             "passed": False,
             "reason": "",
         }

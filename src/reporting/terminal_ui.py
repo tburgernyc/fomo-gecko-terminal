@@ -49,6 +49,11 @@ refresh().catch(console.error); setInterval(()=>refresh().catch(console.error),5
 
 
 def _read_state(connection: Any, token_address: str | None = None) -> dict[str, Any]:
+    snapshot_factory = getattr(connection, "get_readonly_snapshot_conn", None)
+    if callable(snapshot_factory):
+        with snapshot_factory() as snapshot:
+            return _read_state(snapshot, token_address)
+
     with cursor_scope(connection) as cur:
         tokens = cur.execute(
             """
@@ -80,7 +85,7 @@ def _read_state(connection: Any, token_address: str | None = None) -> dict[str, 
             """
             SELECT client_order_id, trader_handle, network, token_address, side,
                    status, requested_usd, filled_usd, entry_price_usd, created_at,
-                   realized_pnl_usd, fee_usd
+                   realized_pnl_usd, fee_usd, execution_detail
             FROM execution_orders
             WHERE token_address = ?
             ORDER BY created_at DESC LIMIT 25
@@ -152,6 +157,7 @@ def _read_state(connection: Any, token_address: str | None = None) -> dict[str, 
             "created_at": row[9].isoformat() if row[9] else None,
             "realized_pnl_usd": row[10],
             "fee_usd": row[11],
+            "execution_detail": row[12],
         }
         for row in orders
     ]

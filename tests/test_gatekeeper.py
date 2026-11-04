@@ -915,6 +915,23 @@ async def test_fomo_leaderboard_uses_keyless_seed_after_unauthorized_response(db
 
 
 @pytest.mark.asyncio
+async def test_fomo_leaderboard_uses_keyless_seed_when_request_raises_unauthorized(db):
+    fomo = FomoLeaderboardClient(db, Settings(fomo_api_key="test-key"))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = httpx.Response(401, request=request)
+        raise httpx.HTTPStatusError(
+            "unauthorized", request=request, response=response
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        rows = await fomo.fetch_leaderboard(client, "24h")
+
+    assert len(rows) == 10
+    assert rows[0]["handle"] == "keyless_demo_01"
+
+
+@pytest.mark.asyncio
 async def test_keyless_fallback_maps_gecko_trending_pools_to_demo_traders(db):
     requests: list[httpx.Request] = []
     pools = [
@@ -952,6 +969,39 @@ async def test_keyless_fallback_maps_gecko_trending_pools_to_demo_traders(db):
     assert all(signal[4] == 0.1 for signal in signals)
     gecko_request = next(request for request in requests if "trending_pools" in str(request.url))
     assert gecko_request.headers["Accept"] == "application/json;version=20230203"
+
+
+@pytest.mark.asyncio
+async def test_position_poll_uses_gecko_fallback_when_request_raises_forbidden(db):
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if "trending_pools" in str(request.url):
+            return httpx.Response(
+                200,
+                json={"data": [{"attributes": {"base_token_address": "mint-1"}}]},
+                request=request,
+            )
+        response = httpx.Response(403, request=request)
+        raise httpx.HTTPStatusError(
+            "forbidden", request=request, response=response
+        )
+
+    fomo = FomoLeaderboardClient(db, Settings(fomo_api_key="test-key"))
+    fomo.top_10_handles = {"trader": 0.1}
+    signals: list[tuple[Any, ...]] = []
+
+    async def capture(*signal: Any) -> str:
+        signals.append(signal)
+        return "accepted"
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await fomo.poll_trader_positions_fallback(client, capture)
+
+    assert len(requests) == 2
+    assert "trending_pools" in str(requests[1].url)
+    assert signals == [("keyless_demo_01", "solana", "mint-1", "BUY", 0.1)]
 
 
 @pytest.mark.asyncio

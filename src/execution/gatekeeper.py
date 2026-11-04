@@ -13,6 +13,7 @@ from src.db import cursor_scope, transaction_scope
 from src.execution.routers import ExecutionResult, OrderIntent, OrderRouter, SubmissionUncertain
 from src.ingestion.gecko_scanner import CHAIN_TO_GECKO
 from src.quant.allocator import PortfolioAllocator
+from src.quant.indicators import evaluate_microstructure_alpha_gate
 from src.utils.notifications import send_alert
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 def passes_memecoin_microstructure_gates(
     pool_metrics: dict[str, Any],
     ohlcv_df: pd.DataFrame | None = None,
+    leader_entry_price: float = 0.0,
 ) -> tuple[bool, str]:
     """Apply anti-rug and anti-exit-liquidity rules to a prospective entry."""
     fdv = float(pool_metrics.get("fdv_usd") or 0.0)
@@ -43,6 +45,30 @@ def passes_memecoin_microstructure_gates(
         last_candle = recent.iloc[-1]
         if last_candle["close"] > last_candle["open"] * 1.03:
             return False, "Rejected: Refusing to chase >3% green spike candle; waiting for pullback"
+
+    if "reserve_in_usd" in pool_metrics:
+        if ohlcv_df is not None and not ohlcv_df.empty:
+            candle = ohlcv_df.iloc[-1]
+            candle_open = float(candle["open"])
+            candle_high = float(candle["high"])
+            candle_low = float(candle["low"])
+            candle_close = float(candle["close"])
+        else:
+            candle_open = candle_high = candle_low = candle_close = float(
+                pool_metrics.get("price_usd") or 0.0
+            )
+        return evaluate_microstructure_alpha_gate(
+            fdv_usd=fdv,
+            liquidity_usd=reserve_usd,
+            volume_24h_usd=vol_24h,
+            buys_m5=int(pool_metrics.get("buys_m5") or 0),
+            sells_m5=int(pool_metrics.get("sells_m5") or 0),
+            candle_open=candle_open,
+            candle_high=candle_high,
+            candle_low=candle_low,
+            candle_close=candle_close,
+            leader_entry_price=leader_entry_price,
+        )
 
     return True, "Passed microstructure gates"
 
@@ -98,14 +124,24 @@ class ExecutionGatekeeper:
             pending = cur.execute(
                 """
                 SELECT client_order_id, tx_hash_or_exchange_id, trader_handle, side, network,
-                       token_address, entry_price_usd, filled_token_amount
+                       token_address, entry_price_usd, filled_token_amount, exit_tranche
                 FROM execution_orders
                 WHERE status IN ('INTENT', 'UNCERTAIN', 'SUBMITTED')
                 ORDER BY created_at
                 """
             ).fetchall()
         unresolved = False
-        for client_order_id, tx_id, trader_handle, side, network, token_address, entry_price, filled_amount in pending:
+        for (
+            client_order_id,
+            tx_id,
+            trader_handle,
+            side,
+            network,
+            token_address,
+            entry_price,
+            filled_amount,
+            exit_tranche,
+        ) in pending:
             reconciliation = await self.router.reconcile(client_order_id, tx_id)
             result = reconciliation if isinstance(reconciliation, ExecutionResult) else None
             state = result.status if result else reconciliation
@@ -127,6 +163,7 @@ class ExecutionGatekeeper:
                             UPDATE execution_orders
                             SET filled_usd = ?, filled_token_amount = ?, fee_usd = ?,
                                 tx_hash_or_exchange_id = COALESCE(?, tx_hash_or_exchange_id),
+                                execution_detail = COALESCE(?, execution_detail),
                                 entry_price_usd = COALESCE(NULLIF(?, 0), entry_price_usd),
                                 remaining_token_amount = CASE WHEN side = 'BUY' THEN ? ELSE 0 END,
                                 updated_at = CURRENT_TIMESTAMP
@@ -134,7 +171,7 @@ class ExecutionGatekeeper:
                             """,
                             [
                                 result.filled_usd, result.filled_token_amount, result.fee_usd,
-                                result.tx_id, result.average_price_usd,
+                                result.tx_id, result.detail, result.average_price_usd,
                                 result.filled_token_amount if side == "BUY" else 0,
                                 client_order_id,
                             ],
@@ -142,15 +179,23 @@ class ExecutionGatekeeper:
                         if side == "SELL":
                             self._apply_sell_fill(
                                 cur, trader_handle, network, token_address,
-                                result.filled_token_amount, entry_price, client_order_id,
+                                result.filled_token_amount,
+                                result.average_price_usd or None,
+                                client_order_id,
+                                exit_tranche,
                             )
                     elif state == "OPEN" and side == "SELL":
                         self._apply_sell_fill(
                             cur, trader_handle, network, token_address,
                             float(filled_amount or 0), entry_price, client_order_id,
+                            exit_tranche,
                         )
             unresolved |= state == "UNCERTAIN"
         return unresolved
+
+    async def reconcile_pending_orders(self) -> bool:
+        async with self._submission_lock:
+            return await self._reconcile_pending_orders()
 
     def _consensus_count(self, network: str, token_address: str) -> int:
         with cursor_scope(self.db) as cur:
@@ -189,12 +234,14 @@ class ExecutionGatekeeper:
         sold_amount: float,
         exit_price: float | None,
         sell_order_id: str,
+        exit_tranche: str | None = None,
     ) -> None:
         remaining_to_close = sold_amount
         realized_pnl = 0.0
         lots = cur.execute(
             """
-            SELECT client_order_id, remaining_token_amount, entry_price_usd, unrealized_pnl_usd
+            SELECT client_order_id, remaining_token_amount, entry_price_usd, unrealized_pnl_usd,
+                   tranche_1_sold_amount, tranche_2_sold_amount
             FROM execution_orders
             WHERE side = 'BUY' AND trader_handle = ? AND network = ? AND token_address = ?
               AND status IN ('OPEN', 'DRY_RUN_OPEN') AND remaining_token_amount > 0
@@ -202,7 +249,7 @@ class ExecutionGatekeeper:
             """,
             [trader_handle, network, token_address],
         ).fetchall()
-        for buy_id, available, entry_price, unrealized in lots:
+        for buy_id, available, entry_price, unrealized, tranche_1_sold, tranche_2_sold in lots:
             if remaining_to_close <= 0:
                 break
             close_amount = min(float(available), remaining_to_close)
@@ -214,6 +261,8 @@ class ExecutionGatekeeper:
                 UPDATE execution_orders
                 SET remaining_token_amount = ?,
                     unrealized_pnl_usd = ?,
+                    tranche_1_sold_amount = ?,
+                    tranche_2_sold_amount = ?,
                     status = CASE WHEN ? <= 1e-12 THEN 'CLOSED' ELSE status END,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE client_order_id = ?
@@ -222,6 +271,12 @@ class ExecutionGatekeeper:
                     max(new_remaining, 0),
                     float(unrealized or 0) * new_remaining / float(available)
                     if available and new_remaining > 1e-12 else 0,
+                    float(tranche_1_sold or 0) + (
+                        close_amount if exit_tranche == "TAKE_PROFIT_1" else 0.0
+                    ),
+                    float(tranche_2_sold or 0) + (
+                        close_amount if exit_tranche == "TAKE_PROFIT_2" else 0.0
+                    ),
                     new_remaining,
                     buy_id,
                 ],
@@ -242,12 +297,19 @@ class ExecutionGatekeeper:
         token_address: str,
         side: str,
         sleeve_weight: float = 0.10,
+        leader_entry_price: float = 0.0,
+        exit_token_amount: float | None = None,
+        exit_tranche: str | None = None,
     ) -> str:
         normalized_side = side.upper()
         if normalized_side not in {"BUY", "SELL"}:
             raise ValueError(f"unsupported order side: {side}")
         if not trader_handle or not network or not token_address:
             raise ValueError("trader, network, and token are required")
+        if exit_token_amount is not None and (
+            normalized_side != "SELL" or not 0 < exit_token_amount
+        ):
+            raise ValueError("exit token amount must be positive and apply only to SELL signals")
         normalized_network = str(network).strip().lower()
         execution_network = CHAIN_TO_GECKO.get(normalized_network, normalized_network)
 
@@ -323,6 +385,9 @@ class ExecutionGatekeeper:
                     if market.get("reserve_in_usd") is not None
                     else market.get("liquidity_usd")
                 ),
+                "buys_m5": market.get("buys_m5", 0),
+                "sells_m5": market.get("sells_m5", 0),
+                "price_usd": market.get("price_usd"),
             }
             market["volume_24h_usd"] = pool_metrics["volume_usd_h24"]
             market["reserve_in_usd"] = pool_metrics["reserve_in_usd"]
@@ -348,7 +413,7 @@ class ExecutionGatekeeper:
                         else None
                     )
                 passed, microstructure_reason = passes_memecoin_microstructure_gates(
-                    pool_metrics, ohlcv_df
+                    pool_metrics, ohlcv_df, leader_entry_price
                 )
                 if not passed:
                     reject_reason = microstructure_reason
@@ -365,15 +430,18 @@ class ExecutionGatekeeper:
                     """
                     INSERT INTO market_snapshots (
                         snapshot_id, network, token_address, pool_address, price_usd,
-                        reserve_in_usd, volume_24h_usd, rsi_14, macd_hist, atr_14,
-                        passed_gate, reject_reason
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        reserve_in_usd, volume_24h_usd, fdv_usd, buys_m5, sells_m5,
+                        rsi_14, macd_hist, atr_14, passed_gate, reject_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         signal_id, execution_network, token_address, market.get("pool_address", ""),
                         market.get("price_usd"), market.get("reserve_in_usd"),
-                        market.get("volume_24h_usd"), market.get("rsi_14"),
-                        market.get("macd_hist"), market.get("atr_14"),
+                        market.get("volume_24h_usd"), pool_metrics["fdv_usd"],
+                        pool_metrics["buys_m5"],
+                        pool_metrics["sells_m5"], market.get("rsi_14"),
+                        market.get("macd_hist"),
+                        market.get("atr_14"),
                         not reject_reason, reject_reason or None,
                     ],
                 )
@@ -426,8 +494,15 @@ class ExecutionGatekeeper:
                         client_order_id, trader_handle, execution_network, token_address,
                         market.get("pool_address", ""), normalized_side, "no_open_copied_position",
                     )
-                requested_notional = min(available_tokens * price, reserve * self.settings.max_pool_liquidity_impact_pct)
-                token_amount = min(available_tokens, requested_notional / price)
+                sell_amount = min(
+                    available_tokens,
+                    exit_token_amount if exit_token_amount is not None else available_tokens,
+                )
+                requested_notional = min(
+                    sell_amount * price,
+                    reserve * self.settings.max_pool_liquidity_impact_pct,
+                )
+                token_amount = min(sell_amount, requested_notional / price)
             else:
                 requested_notional = 0.0
                 token_amount = 0.0
@@ -462,17 +537,39 @@ class ExecutionGatekeeper:
                 pool_reserve_usd=reserve,
                 token_amount=token_amount,
             )
+            exit_campaign_id: str | None = None
+            if normalized_side == "BUY":
+                with cursor_scope(self.db) as cur:
+                    active_campaign = cur.execute(
+                        """
+                        SELECT exit_campaign_id
+                        FROM execution_orders
+                        WHERE side = 'BUY' AND trader_handle = ? AND network = ?
+                          AND token_address = ? AND status IN ('OPEN', 'DRY_RUN_OPEN')
+                          AND remaining_token_amount > 0
+                        ORDER BY created_at
+                        LIMIT 1
+                        """,
+                        [trader_handle, execution_network, token_address],
+                    ).fetchone()
+                exit_campaign_id = (
+                    str(active_campaign[0]) if active_campaign and active_campaign[0]
+                    else client_order_id
+                )
             with transaction_scope(self.db) as cur:
                 cur.execute(
                     """
                     INSERT INTO execution_orders (
                         client_order_id, trader_handle, network, token_address, pool_address,
-                        side, status, requested_usd
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'INTENT', ?)
+                        side, status, requested_usd, entry_atr_usd, exit_campaign_id,
+                        exit_tranche
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'INTENT', ?, ?, ?, ?)
                     """,
                     [
                         client_order_id, trader_handle, execution_network, token_address,
                         market.get("pool_address", ""), normalized_side, ticket,
+                        market.get("atr_14") if normalized_side == "BUY" else None,
+                        exit_campaign_id, exit_tranche,
                     ],
                 )
                 cur.execute(
@@ -533,6 +630,7 @@ class ExecutionGatekeeper:
                     UPDATE execution_orders
                     SET status = ?, filled_usd = ?, filled_token_amount = ?, entry_price_usd = ?,
                         high_water_price_usd = ?, fee_usd = ?, tx_hash_or_exchange_id = ?,
+                        execution_detail = ?,
                         remaining_token_amount = CASE WHEN side = 'BUY' THEN ? ELSE 0 END,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE client_order_id = ?
@@ -541,6 +639,7 @@ class ExecutionGatekeeper:
                         result.status, result.filled_usd, result.filled_token_amount,
                         result.average_price_usd or price,
                         result.average_price_usd or price, result.fee_usd, result.tx_id,
+                        result.detail,
                         result.filled_token_amount if normalized_side == "BUY" else 0,
                         client_order_id,
                     ],
@@ -549,6 +648,7 @@ class ExecutionGatekeeper:
                     self._apply_sell_fill(
                         cur, trader_handle, execution_network, token_address,
                         result.filled_token_amount, result.average_price_usd or price, client_order_id,
+                        exit_tranche,
                     )
             await self._notify(
                 f"Copy signal executed for {trader_handle}: {normalized_side} "

@@ -15,6 +15,7 @@ dependencies = [
     "lightweight-charts>=2.1.0",
     "numpy>=1.26.4",
     "pandas>=2.2.0",
+    "pyarrow>=15.0.0",
     "pydantic>=2.9.0",
     "pydantic-settings>=2.5.0",
     "quantstats>=0.0.63",
