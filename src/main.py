@@ -17,6 +17,7 @@ from src.execution.routers import (
     DirectOnChainRouter,
     DryRunRouter,
     FreqtradeWebhookRouter,
+    MeteoraDLMMHybridRouter,
     OrderRouter,
     close_router,
 )
@@ -53,8 +54,10 @@ def build_router(settings: Any, client: httpx.AsyncClient) -> OrderRouter:
             "after explicitly confirming live execution."
         )
     if settings.execution_router == "freqtrade":
-        return FreqtradeWebhookRouter(settings, client)
-    return DirectOnChainRouter(settings, client)
+        base_router: OrderRouter = FreqtradeWebhookRouter(settings, client)
+    else:
+        base_router = DirectOnChainRouter(settings, client)
+    return MeteoraDLMMHybridRouter(base_router, settings, client)
 
 
 async def sync_initial_top_10(fomo: FomoLeaderboardClient, client: httpx.AsyncClient) -> None:
@@ -91,7 +94,8 @@ async def monitor_open_positions(
                        / NULLIF(SUM(o.filled_token_amount), 0),
                    MAX(o.high_water_price_usd), MIN(o.created_at),
                    MAX(o.entry_atr_usd), SUM(o.tranche_1_sold_amount),
-                   SUM(o.tranche_2_sold_amount), t.sleeve_weight
+                   SUM(o.tranche_2_sold_amount), t.sleeve_weight,
+                   MIN(o.signal_slot)
             FROM execution_orders o
             LEFT JOIN leaderboard_traders t ON t.user_handle = o.trader_handle
             WHERE o.side = 'BUY'
@@ -117,6 +121,7 @@ async def monitor_open_positions(
         tranche_1_sold,
         tranche_2_sold,
         weight,
+        entry_slot,
     ) in orders:
         if not entry or float(entry) <= 0 or float(remaining_amount or 0) <= 0:
             continue
@@ -125,7 +130,19 @@ async def monitor_open_positions(
         if current <= 0:
             continue
         latest_high = max(float(high_water or entry), current)
-        age_minutes = (now - created_at).total_seconds() / 60
+        current_slot_value = market.get(
+            "historical_slot", getattr(scanner, "current_slot", None)
+        )
+        current_slot = (
+            int(current_slot_value)
+            if current_slot_value is not None
+            else int(now.timestamp() / 0.4)
+        )
+        held_slots = (
+            max(0, current_slot - int(entry_slot))
+            if entry_slot is not None
+            else max(0, int((now - created_at).total_seconds() / 0.4))
+        )
         pnl = (current - float(entry)) / float(entry)
         initial_amount = float(filled_amount or 0)
         remaining = float(remaining_amount or 0)
@@ -136,26 +153,26 @@ async def monitor_open_positions(
         exit_amount: float | None = None
         exit_tranche: str | None = None
 
-        if age_minutes >= settings.exit_time_stop_minutes and pnl < 0.08:
-            exit_amount, exit_tranche = remaining, "TIME_STOP"
-        elif not tranche_1_done and pnl + 1e-9 >= 0.65:
+        if pnl <= -0.11:
+            exit_amount, exit_tranche = remaining, "HARD_STOP_LOSS"
+        elif not tranche_1_done and pnl + 1e-9 >= 0.28:
             exit_amount = min(remaining, tranche_1_target - float(tranche_1_sold or 0))
             exit_tranche = "TAKE_PROFIT_1"
-        elif tranche_1_done and not tranche_2_done and pnl + 1e-9 >= 1.50:
+        elif tranche_1_done and not tranche_2_done and pnl + 1e-9 >= 0.75:
             exit_amount = min(remaining, tranche_2_target - float(tranche_2_sold or 0))
             exit_tranche = "TAKE_PROFIT_2"
+        elif held_slots >= 2_000:
+            exit_amount, exit_tranche = remaining, "TIME_STOP"
         else:
             stop_price: float | None = None
-            if tranche_2_done and float(entry_atr or 0) > 0:
-                stop_price = latest_high - 2.2 * float(entry_atr)
-                if tranche_1_done:
-                    stop_price = max(stop_price, float(entry))
+            if tranche_2_done:
+                stop_price = (
+                    latest_high - 2.2 * float(entry_atr)
+                    if float(entry_atr or 0) > 0
+                    else latest_high * (1 - settings.trailing_stop_pct)
+                )
             elif tranche_1_done:
                 stop_price = float(entry)
-            elif latest_high > 0 and (
-                latest_high - current
-            ) / latest_high >= settings.trailing_stop_pct:
-                stop_price = current
             if stop_price is not None and current <= stop_price:
                 exit_amount, exit_tranche = remaining, "TRAILING_STOP"
 

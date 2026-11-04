@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     jupiter_base_url: str = "https://quote-api.jup.ag/v6"
     jito_block_engine_url: str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles"
     solana_fee_budget_lamports: int = 150_000
+    meteora_dlmm_sidecar_url: str = ""
+    meteora_dlmm_min_liquidity_usd: float = 25_000.0
     zerox_base_url: str = "https://api.0x.org"
     zerox_api_key: SecretStr = SecretStr("")
     freqtrade_webhook_url: str = ""
@@ -60,7 +62,12 @@ class Settings(BaseSettings):
             raise ValueError("percentage settings must be in (0, 1]")
         return value
 
-    @field_validator("starting_bankroll_usd", "min_pool_liquidity_usd", "min_pool_volume_24h_usd")
+    @field_validator(
+        "starting_bankroll_usd",
+        "min_pool_liquidity_usd",
+        "min_pool_volume_24h_usd",
+        "meteora_dlmm_min_liquidity_usd",
+    )
     @classmethod
     def validate_positive(cls, value: float) -> float:
         if value <= 0:

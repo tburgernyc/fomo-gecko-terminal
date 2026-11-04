@@ -151,6 +151,30 @@ class HistoricalReplayer:
             "fdv_usd": float(fdv),
         }
 
+    def get_last_pool_state(self, token_address: str) -> dict[str, Any] | None:
+        """Return the final available historical state for a token."""
+        row = self.connection.execute(
+            """
+            SELECT timestamp, slot, price_usd, reserve_in_usd, volume_usd_h24, fdv_usd
+            FROM historical_events
+            WHERE token_address = ?
+            ORDER BY slot DESC, timestamp DESC, _event_id DESC
+            LIMIT 1
+            """,
+            [token_address],
+        ).fetchone()
+        if row is None:
+            return None
+        timestamp, slot, price, reserve, volume, fdv = row
+        return {
+            "timestamp": timestamp,
+            "slot": int(slot),
+            "price_usd": float(price),
+            "reserve_in_usd": float(reserve),
+            "volume_usd_h24": float(volume),
+            "fdv_usd": float(fdv),
+        }
+
     def current_pool_states(self) -> dict[str, dict[str, Any]]:
         """Return the latest observed state for each token up to the replay cursor."""
         rows = self.connection.execute(
@@ -199,7 +223,7 @@ class HistoricalReplayer:
         timestamp, slot, price, reserve, volume, fdv = row
         history = self.connection.execute(
             """
-            SELECT price_usd
+            SELECT price_usd, reserve_in_usd
             FROM historical_events
             WHERE token_address = ? AND _event_id <= ?
             ORDER BY _event_id DESC
@@ -207,7 +231,8 @@ class HistoricalReplayer:
             """,
             [token_address, self.current_event_id],
         ).fetchall()
-        closes = np.asarray([float(item[0]) for item in reversed(history)], dtype=np.float64)
+        chronological_history = list(reversed(history))
+        closes = np.asarray([float(item[0]) for item in chronological_history], dtype=np.float64)
         indicators = calculate_indicators(closes)
         reserve_value = float(reserve)
         volume_value = float(volume)
@@ -236,6 +261,8 @@ class HistoricalReplayer:
             "reason": reason,
             "historical_timestamp": timestamp,
             "historical_slot": int(slot),
+            "price_history_usd": [float(item[0]) for item in chronological_history[-5:]],
+            "reserve_history_usd": [float(item[1]) for item in chronological_history[-5:]],
         }
 
     def close(self) -> None:

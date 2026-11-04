@@ -16,6 +16,11 @@ from src.execution.routers import (
     JITO_TIP_ACCOUNTS,
     DirectOnChainRouter,
     DryRunRouter,
+    ExecutionResult,
+    JitoBundleRejected,
+    MeteoraDLMMHybridRouter,
+    OrderIntent,
+    route_jit_dlmm_order,
     build_jupiter_swap_payload,
     compute_fee_split,
     jitodontfront_instruction,
@@ -25,6 +30,7 @@ from src.ingestion.gecko_scanner import GeckoTerminalScanner
 from src.main import monitor_open_positions
 from src.quant.backtest_vbt import (
     constant_product_slippage,
+    run_three_tranche_campaign_backtest,
     run_slippage_adjusted_backtest,
     sweep_exit_parameters,
     target_metrics_met,
@@ -216,6 +222,8 @@ def test_gatekeeper_persists_microstructure_inputs_and_entry_atr(db):
                 "buys_m5": 20,
                 "sells_m5": 10,
                 "price_usd": 1.0,
+                "price_history_usd": [0.6, 0.7, 0.8, 0.9, 1.0],
+                "reserve_history_usd": [30000.0, 35000.0, 40000.0, 45000.0, 50000.0],
                 "rsi_14": 50.0,
                 "macd_hist": 0.02,
                 "atr_14": 0.01,
@@ -263,8 +271,8 @@ def test_slippage_backtest_models_nonlinear_amm_impact_and_targets():
     assert result["metrics"]["latency_seconds"] == pytest.approx(0.4)
     assert result["metrics"]["friction_per_leg"] == pytest.approx(0.008)
     assert result["metrics"]["mean_amm_slippage"] > 0
-    assert target_metrics_met(1.46, -0.149)
-    assert not target_metrics_met(1.45, -0.10)
+    assert target_metrics_met(1.66, -0.149)
+    assert not target_metrics_met(1.65, -0.10)
     assert not target_metrics_met(2.0, -0.15)
     sweep = sweep_exit_parameters(
         close,
@@ -277,6 +285,151 @@ def test_slippage_backtest_models_nonlinear_amm_impact_and_targets():
     assert bool(sweep.iloc[0]["target_metrics_met"]) == target_metrics_met(
         float(sweep.iloc[0]["profit_factor"]), float(sweep.iloc[0]["max_drawdown"])
     )
+
+
+def test_three_tranche_backtest_harvests_and_applies_hard_stop():
+    index = pd.RangeIndex(6)
+    close = pd.Series([1.0, 1.30, 1.80, 1.40, 0.88, 0.75], index=index)
+    entries = pd.Series([True, False, False, False, True, False], index=index)
+    result = run_three_tranche_campaign_backtest(
+        close,
+        entries,
+        position_size_usd=100,
+        friction_per_leg=0.008,
+    )
+    fills = result["trades"]
+    assert list(fills["tranche"]) == [
+        "TAKE_PROFIT_1",
+        "TAKE_PROFIT_2",
+        "TRAILING_ATR",
+        "HARD_STOP_LOSS",
+    ]
+    assert list(fills["position_fraction"]) == pytest.approx([0.4, 0.4, 0.2, 1.0])
+    assert result["metrics"]["total_fees_usd"] > 0
+
+
+@pytest.mark.asyncio
+async def test_meteora_dlmm_adapter_requests_atomic_ladder_and_hwm_withdrawal():
+    request_payload: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_payload
+        request_payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "status": "OPEN",
+                "atomic": True,
+                "hwm_withdrawal_armed": True,
+                "filled_usd": 100.0,
+                "filled_token_amount": 50.0,
+                "average_price_usd": 2.0,
+                "fee_usd": 0.1,
+                "tx_id": "signature",
+            },
+        )
+
+    intent = OrderIntent(
+        "dlmm-order", "whale", "solana", "mint", "BUY", 100, 2, 50_000,
+        high_conviction=True, meteora_dlmm_pool_address="pool",
+        meteora_active_bin_id=100,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await route_jit_dlmm_order(
+            intent,
+            sidecar_url="http://sidecar.test/order",
+            pool_address="pool",
+            active_bin_id=100,
+            pool_liquidity_usd=50_000,
+            minimum_liquidity_usd=25_000,
+            client=client,
+        )
+
+    assert result.status == "OPEN"
+    assert request_payload["atomic"] is True
+    assert request_payload["bin_ladder"] == {
+        "from_bin_id": 102,
+        "to_bin_id": 114,
+        "strategy": "single_sided_upward_bid_ask",
+    }
+    assert request_payload["withdraw_on_high_water_reversal"]["enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_live_sell_retry_waits_for_slots_and_escalates_jito_tip(monkeypatch):
+    router = DirectOnChainRouter(Settings())
+    intent = OrderIntent("sell-order", "trader", "solana", "mint", "SELL", 100, 1, 50_000, 10)
+    multipliers: list[float] = []
+    wait_count = 0
+
+    async def submit_once(
+        order: OrderIntent, *, tip_multiplier: float
+    ) -> ExecutionResult:
+        multipliers.append(tip_multiplier)
+        if len(multipliers) < 3:
+            raise JitoBundleRejected("bundle dropped")
+        return ExecutionResult("SUBMITTED", tx_id="signature")
+
+    async def wait_for_slot() -> None:
+        nonlocal wait_count
+        wait_count += 1
+
+    monkeypatch.setattr(router, "_submit_solana_once", submit_once)
+    monkeypatch.setattr(router, "_wait_for_next_solana_slot", wait_for_slot)
+
+    result = await router._submit_solana(intent)
+
+    assert result.tx_id == "signature"
+    assert multipliers == pytest.approx([1.0, 1.75, 1.75**2])
+    assert wait_count == 2
+
+
+@pytest.mark.asyncio
+async def test_hybrid_dlmm_router_discovers_and_routes_qualifying_whale_buy():
+    operations: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        operations.append(payload["operation"])
+        if payload["operation"] == "find_active_pool":
+            return httpx.Response(
+                200,
+                json={
+                    "status": "FOUND",
+                    "active": True,
+                    "pool_address": "discovered-pool",
+                    "active_bin_id": 100,
+                    "liquidity_usd": 50_000,
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "status": "OPEN",
+                "atomic": True,
+                "hwm_withdrawal_armed": True,
+                "filled_usd": 100,
+                "filled_token_amount": 50,
+                "average_price_usd": 2,
+                "fee_usd": 0.1,
+                "tx_id": "signature",
+            },
+        )
+
+    intent = OrderIntent(
+        "whale-buy", "whale", "solana", "mint", "BUY", 100, 2, 50_000,
+        high_conviction=True,
+    )
+    settings = Settings(
+        meteora_dlmm_sidecar_url="http://sidecar.test/order",
+        meteora_dlmm_min_liquidity_usd=25_000,
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        router = MeteoraDLMMHybridRouter(DryRunRouter(), settings, client)
+        result = await router.submit(intent)
+
+    assert result.status == "OPEN"
+    assert operations == ["find_active_pool", "open_jit_position"]
 
 
 class _Market:
@@ -367,7 +520,9 @@ async def test_position_exit_engine_uses_atr_trail_and_twelve_minute_time_stop(d
         high_water_price_usd=2.5,
     )
     settings = Settings(starting_bankroll_usd=10_000)
-    gatekeeper = ExecutionGatekeeper(db, _Market(2.2), DryRunRouter(), settings)
+    router = DryRunRouter()
+    router.minimum_fee_usd = 0.0
+    gatekeeper = ExecutionGatekeeper(db, _Market(2.2), router, settings)
     async with httpx.AsyncClient() as client:
         await monitor_open_positions(client, db, _Market(2.2), gatekeeper, settings)
     trail = db.execute(
@@ -378,7 +533,7 @@ async def test_position_exit_engine_uses_atr_trail_and_twelve_minute_time_stop(d
     db.execute("DELETE FROM execution_orders")
     _seed_open_position(
         db,
-        created_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=13),
+        created_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=14),
     )
     time_stop_gatekeeper = ExecutionGatekeeper(
         db, _Market(1.05), DryRunRouter(), settings

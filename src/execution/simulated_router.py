@@ -75,29 +75,86 @@ class SimulatedOnChainRouter:
         if intent.notional_usd <= 0 or intent.pool_reserve_usd <= 0 or intent.price_usd <= 0:
             raise ValueError("simulated order requires positive notional, price, and liquidity")
 
+        first_attempt = len(self.attempts)
+        first_slot = self.replayer.current_slot + self.latency_slots
+        retry_limit = 4 if intent.side == "SELL" else 0
+        for retry_index in range(retry_limit + 1):
+            try:
+                result = await self._execute_attempt(
+                    intent,
+                    execution_slot=first_slot + retry_index,
+                    tip_multiplier=1.75**retry_index,
+                    force_inclusion=(intent.side == "SELL" and retry_index == retry_limit),
+                )
+                if retry_index == 0:
+                    return result
+                retry_fees = sum(
+                    float(attempt["fee_usd"])
+                    for attempt in self.attempts[first_attempt:]
+                )
+                return ExecutionResult(
+                    status=result.status,
+                    filled_usd=result.filled_usd,
+                    filled_token_amount=result.filled_token_amount,
+                    fee_usd=retry_fees,
+                    average_price_usd=result.average_price_usd,
+                    tx_id=result.tx_id,
+                    detail=f"{result.detail};sell_retries={retry_index}",
+                )
+            except RuntimeError as exc:
+                if intent.side != "SELL" or "bundle dropped" not in str(exc).lower():
+                    raise
+                if retry_index == retry_limit:
+                    raise
+                logger.warning(
+                    "Simulated SELL bundle dropped for %s at slot %d; retrying at slot %d "
+                    "with %.2fx Jito tip",
+                    intent.token_address,
+                    first_slot + retry_index,
+                    first_slot + retry_index + 1,
+                    1.75 ** (retry_index + 1),
+                )
+        raise RuntimeError("simulated SELL retry loop exited without a result")
+
+    async def _execute_attempt(
+        self,
+        intent: OrderIntent,
+        *,
+        execution_slot: int,
+        tip_multiplier: float,
+        force_inclusion: bool,
+    ) -> ExecutionResult:
         priority_fee_sol = self._priority_rng.uniform(*self.PRIORITY_FEE_RANGE_SOL)
         fee_usd = (
-            self.JITO_TIP_SOL + self.COMPUTE_FEE_SOL + priority_fee_sol
+            self.JITO_TIP_SOL * tip_multiplier + self.COMPUTE_FEE_SOL + priority_fee_sol
         ) * self.sol_price_usd
         self.cash_balance_usd -= fee_usd
         self.total_fees_paid_usd += fee_usd
-        target_slot = self.replayer.current_slot + self.latency_slots
         attempt: dict[str, Any] = {
             "client_order_id": intent.client_order_id,
             "side": intent.side,
             "signal_slot": self.replayer.current_slot,
-            "execution_slot": target_slot,
+            "execution_slot": execution_slot,
             "notional_usd": intent.notional_usd,
             "priority_fee_sol": priority_fee_sol,
+            "jito_tip_multiplier": tip_multiplier,
             "fee_usd": fee_usd,
             "status": "FAILED",
             "fill_price_usd": None,
             "failure_reason": None,
         }
         try:
-            future_state = self.replayer.get_pool_state_at_slot(intent.token_address, target_slot)
+            future_state = self.replayer.get_pool_state_at_slot(
+                intent.token_address, execution_slot
+            )
+            used_final_state = False
+            if future_state is None and intent.side == "SELL":
+                future_state = self.replayer.get_last_pool_state(intent.token_address)
+                used_final_state = future_state is not None
             if future_state is None:
-                raise RuntimeError(f"no historical pool state at or after execution slot {target_slot}")
+                raise RuntimeError(
+                    f"no historical pool state at or after execution slot {execution_slot}"
+                )
 
             base_slippage_pct = intent.notional_usd / float(future_state["reserve_in_usd"]) * 100
             volatility_penalty_pct = self._rng.uniform(0.5, 2.0)
@@ -109,7 +166,7 @@ class SimulatedOnChainRouter:
             if fill_price <= 0:
                 raise RuntimeError("simulated slippage produced a non-positive fill price")
 
-            if self._rng.random() < self.failure_probability:
+            if not force_inclusion and self._rng.random() < self.failure_probability:
                 raise RuntimeError("simulated Jito bundle dropped during slot congestion")
 
             if intent.side == "BUY":
@@ -128,13 +185,15 @@ class SimulatedOnChainRouter:
                     "status": "OPEN",
                     "fill_price_usd": fill_price,
                     "failure_reason": None,
+                    "used_final_historical_state": used_final_state,
+                    "priority_tip_inclusion": force_inclusion,
                 }
             )
             logger.info(
                 "Simulated %s %s at slot %d: price=%.10f slippage=%.3f%% fee=$%.4f",
                 intent.side,
                 intent.token_address,
-                target_slot,
+                execution_slot,
                 fill_price,
                 total_slippage_pct,
                 fee_usd,
@@ -147,10 +206,13 @@ class SimulatedOnChainRouter:
                 average_price_usd=fill_price,
                 tx_id=f"sim-{intent.client_order_id}",
                 detail=(
-                    f"signal_slot={self.replayer.current_slot};execution_slot={target_slot};"
+                    f"signal_slot={self.replayer.current_slot};execution_slot={execution_slot};"
                     f"base_slippage_pct={base_slippage_pct:.6f};"
                     f"volatility_penalty_pct={volatility_penalty_pct:.6f};"
-                    f"priority_fee_sol={priority_fee_sol:.8f}"
+                    f"priority_fee_sol={priority_fee_sol:.8f};"
+                    f"jito_tip_multiplier={tip_multiplier:.6f};"
+                    f"used_final_historical_state={used_final_state};"
+                    f"priority_tip_inclusion={force_inclusion}"
                 ),
             )
         except (RuntimeError, ValueError) as exc:

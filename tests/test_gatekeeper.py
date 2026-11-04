@@ -59,6 +59,8 @@ def market() -> dict[str, Any]:
         "reserve_in_usd": 50000.0,
         "volume_24h_usd": 120000.0,
         "price_usd": 1.25,
+        "price_history_usd": [0.85, 0.95, 1.05, 1.15, 1.25],
+        "reserve_history_usd": [30000.0, 35000.0, 40000.0, 45000.0, 50000.0],
         "rsi_14": 54.0,
         "macd_hist": 0.02,
         "atr_14": 0.01,
@@ -99,6 +101,80 @@ async def test_chain_aliases_share_the_same_idempotency_key(db, market):
     assert first.startswith("EXECUTED:DRY_RUN_OPEN:")
     assert second == "DUPLICATE_SKIPPED:DRY_RUN_OPEN"
     assert scanner.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_reentry_cooldown_is_token_wide_and_enforces_1200_slots(db, market):
+    db.execute(
+        """
+        INSERT INTO execution_orders (
+            client_order_id, trader_handle, network, token_address, side, status,
+            requested_usd, filled_token_amount, signal_slot
+        ) VALUES ('prior-exit', 'trader-a', 'solana', 'TokenMint111', 'SELL',
+                  'OPEN', 100, 10, 100)
+        """
+    )
+    scanner = StubScanner({**market, "historical_slot": 1299})
+    gatekeeper = ExecutionGatekeeper(
+        db, scanner, DryRunRouter(), Settings(starting_bankroll_usd=10_000)
+    )
+    async with httpx.AsyncClient() as client:
+        blocked = await gatekeeper.process_copy_signal(
+            client, "trader-b", "solana", "TokenMint111", "BUY"
+        )
+        scanner.response = {**market, "historical_slot": 1300}
+        allowed = await gatekeeper.process_copy_signal(
+            client, "trader-c", "solana", "TokenMint111", "BUY"
+        )
+    assert blocked == "REJECTED:reentry_cooldown:1_slots_remaining"
+    assert allowed.startswith("EXECUTED:DRY_RUN_OPEN:")
+
+
+@pytest.mark.asyncio
+async def test_secondary_buy_is_ignored_during_token_trend_hold(db, market):
+    db.execute(
+        """
+        INSERT INTO execution_orders (
+            client_order_id, trader_handle, network, token_address, side, status,
+            requested_usd, filled_token_amount, remaining_token_amount, signal_slot
+        ) VALUES ('active-buy', 'trader-a', 'solana', 'TokenMint111', 'BUY',
+                  'OPEN', 100, 100, 100, 500)
+        """
+    )
+    scanner = StubScanner({**market, "historical_slot": 700})
+    gatekeeper = ExecutionGatekeeper(db, scanner, DryRunRouter(), Settings())
+    async with httpx.AsyncClient() as client:
+        result = await gatekeeper.process_copy_signal(
+            client, "trader-b", "solana", "TokenMint111", "BUY"
+        )
+    assert result == "REJECTED:minimum_trend_hold:additional_buy_ignored"
+
+
+def test_rolling_regime_filter_requires_five_expanding_higher_low_snapshots(db, market):
+    gatekeeper = ExecutionGatekeeper(
+        db, StubScanner(market), DryRunRouter(), Settings()
+    )
+    accepted, _ = gatekeeper._passes_rolling_regime_filter(
+        "solana", "TokenMint111", 1.25, 50_000, market
+    )
+    insufficient, reason = gatekeeper._passes_rolling_regime_filter(
+        "solana", "OtherToken", 1.25, 50_000, {}
+    )
+    no_expansion, expansion_reason = gatekeeper._passes_rolling_regime_filter(
+        "solana",
+        "OtherToken",
+        1.25,
+        50_000,
+        {
+            "price_history_usd": [0.85, 0.95, 1.05, 1.15, 1.25],
+            "reserve_history_usd": [50_000, 45_000, 40_000, 45_000, 50_000],
+        },
+    )
+    assert accepted is True
+    assert insufficient is False
+    assert reason == "insufficient_regime_history:requires_5_snapshots"
+    assert no_expansion is False
+    assert expansion_reason == "liquidity_not_expanding_over_5_snapshots"
 
 
 @pytest.mark.asyncio
@@ -750,6 +826,7 @@ async def test_sell_closes_the_open_dry_run_position_and_realizes_pnl(db, market
         buy = await gatekeeper.process_copy_signal(
             client, "buyer", "1399811149", "TokenMint111", "BUY", 0.10
         )
+        gatekeeper.scanner.response = {**market, "price_usd": 1.65}
         sell = await gatekeeper.process_copy_signal(
             client, "buyer", "solana", "TokenMint111", "SELL", 0.10
         )
@@ -777,8 +854,10 @@ async def test_sell_ticket_does_not_close_more_than_its_clamped_quantity(db, mar
             client_order_id, trader_handle, network, token_address, side, status,
             requested_usd, filled_usd, filled_token_amount, remaining_token_amount,
             entry_price_usd, high_water_price_usd
+            , created_at
         ) VALUES ('large_position', 'buyer', 'solana', 'TokenMint111', 'BUY',
-                  'DRY_RUN_OPEN', 2500, 2500, 2000, 2000, 1.25, 1.25)
+                  'DRY_RUN_OPEN', 2500, 2500, 2000, 2000, 1.25, 1.25,
+                  CURRENT_TIMESTAMP - INTERVAL 13 MINUTE)
         """
     )
     db.execute(
@@ -787,8 +866,10 @@ async def test_sell_ticket_does_not_close_more_than_its_clamped_quantity(db, mar
             client_order_id, trader_handle, network, token_address, side, status,
             requested_usd, filled_usd, filled_token_amount, remaining_token_amount,
             entry_price_usd, high_water_price_usd
+            , created_at
         ) VALUES ('other_trader_position', 'other', 'solana', 'TokenMint111', 'BUY',
-                  'DRY_RUN_OPEN', 1250, 1250, 1000, 1000, 1.25, 1.25)
+                  'DRY_RUN_OPEN', 1250, 1250, 1000, 1000, 1.25, 1.25,
+                  CURRENT_TIMESTAMP - INTERVAL 13 MINUTE)
         """
     )
     gatekeeper = ExecutionGatekeeper(
@@ -808,8 +889,8 @@ async def test_sell_ticket_does_not_close_more_than_its_clamped_quantity(db, mar
     sold = db.execute(
         "SELECT filled_token_amount FROM execution_orders WHERE side = 'SELL'"
     ).fetchone()[0]
-    assert sold <= 480
-    assert remaining >= 1520
+    assert sold == pytest.approx(800)
+    assert remaining == pytest.approx(1200)
     assert other_remaining == 1000
 
 

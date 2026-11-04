@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import logging
+import math
 import time
 from typing import Any
 
@@ -17,6 +18,10 @@ from src.quant.indicators import evaluate_microstructure_alpha_gate
 from src.utils.notifications import send_alert
 
 logger = logging.getLogger(__name__)
+
+REENTRY_COOLDOWN_SLOTS = 1_200
+MINIMUM_TREND_HOLD_SLOTS = 1_800
+TREND_HOLD_EXIT_THRESHOLDS = (-0.11, 0.28, 0.65, 1.50)
 
 
 def passes_memecoin_microstructure_gates(
@@ -82,7 +87,7 @@ class ExecutionGatekeeper:
         scanner: Any,
         router: OrderRouter,
         settings: Settings | None = None,
-    ):
+    ) -> None:
         self.db = connection
         self.scanner = scanner
         self.router = router
@@ -162,6 +167,7 @@ class ExecutionGatekeeper:
                             """
                             UPDATE execution_orders
                             SET filled_usd = ?, filled_token_amount = ?, fee_usd = ?,
+                                campaign_fees_usd = CASE WHEN side = 'BUY' THEN ? ELSE campaign_fees_usd END,
                                 tx_hash_or_exchange_id = COALESCE(?, tx_hash_or_exchange_id),
                                 execution_detail = COALESCE(?, execution_detail),
                                 entry_price_usd = COALESCE(NULLIF(?, 0), entry_price_usd),
@@ -171,6 +177,7 @@ class ExecutionGatekeeper:
                             """,
                             [
                                 result.filled_usd, result.filled_token_amount, result.fee_usd,
+                                result.fee_usd,
                                 result.tx_id, result.detail, result.average_price_usd,
                                 result.filled_token_amount if side == "BUY" else 0,
                                 client_order_id,
@@ -183,6 +190,7 @@ class ExecutionGatekeeper:
                                 result.average_price_usd or None,
                                 client_order_id,
                                 exit_tranche,
+                                result.fee_usd,
                             )
                     elif state == "OPEN" and side == "SELL":
                         self._apply_sell_fill(
@@ -210,6 +218,129 @@ class ExecutionGatekeeper:
             ).fetchone()
         return int(row[0]) if row else 0
 
+    def _current_slot(self, market: dict[str, Any] | None = None) -> int:
+        """Use replay/live scanner slots when available, otherwise a 400 ms slot clock."""
+        for value in (
+            (market or {}).get("historical_slot"),
+            (market or {}).get("slot"),
+            getattr(self.scanner, "current_slot", None),
+        ):
+            if value is not None:
+                try:
+                    slot = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if slot >= 0:
+                    return slot
+        return int(time.time() / 0.4)
+
+    def _last_exit_slot(self, network: str, token_address: str) -> int | None:
+        with cursor_scope(self.db) as cur:
+            row = cur.execute(
+                """
+                SELECT signal_slot, created_at
+                FROM execution_orders
+                WHERE side = 'SELL' AND network = ? AND token_address = ?
+                  AND filled_token_amount > 0
+                  AND status IN ('OPEN', 'CLOSED', 'DRY_RUN_OPEN', 'DRY_RUN_CLOSED')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                [network, token_address],
+            ).fetchone()
+        if not row:
+            return None
+        if row[0] is not None:
+            return int(row[0])
+        return int(float(row[1].timestamp()) / 0.4)
+
+    def _active_position_entry_slot(
+        self, trader_handle: str, network: str, token_address: str
+    ) -> int | None:
+        with cursor_scope(self.db) as cur:
+            row = cur.execute(
+                """
+                SELECT signal_slot, created_at
+                FROM execution_orders
+                WHERE side = 'BUY' AND trader_handle = ? AND network = ?
+                  AND token_address = ? AND remaining_token_amount > 0
+                  AND status IN ('OPEN', 'DRY_RUN_OPEN')
+                ORDER BY created_at
+                LIMIT 1
+                """,
+                [trader_handle, network, token_address],
+            ).fetchone()
+        if not row:
+            return None
+        if row[0] is not None:
+            return int(row[0])
+        return int(float(row[1].timestamp()) / 0.4)
+
+    def _active_token_entry_slot(self, network: str, token_address: str) -> int | None:
+        with cursor_scope(self.db) as cur:
+            row = cur.execute(
+                """
+                SELECT signal_slot, created_at
+                FROM execution_orders
+                WHERE side = 'BUY' AND network = ? AND token_address = ?
+                  AND remaining_token_amount > 0
+                  AND status IN ('OPEN', 'DRY_RUN_OPEN')
+                ORDER BY created_at
+                LIMIT 1
+                """,
+                [network, token_address],
+            ).fetchone()
+        if not row:
+            return None
+        if row[0] is not None:
+            return int(row[0])
+        return int(float(row[1].timestamp()) / 0.4)
+
+    def _passes_rolling_regime_filter(
+        self,
+        network: str,
+        token_address: str,
+        price_usd: float,
+        reserve_usd: float,
+        market: dict[str, Any],
+    ) -> tuple[bool, str]:
+        """Require five causal observations, expanding reserves, and price above their SMA."""
+        price_history = market.get("price_history_usd")
+        reserve_history = market.get("reserve_history_usd")
+        if isinstance(price_history, (list, tuple)) and isinstance(
+            reserve_history, (list, tuple)
+        ):
+            prices = [float(value) for value in price_history[-5:]]
+            reserves = [float(value) for value in reserve_history[-5:]]
+        else:
+            with cursor_scope(self.db) as cur:
+                rows = cur.execute(
+                    """
+                    SELECT price_usd, reserve_in_usd
+                    FROM market_snapshots
+                    WHERE network = ? AND token_address = ?
+                    ORDER BY captured_at DESC, snapshot_id DESC
+                    LIMIT 4
+                    """,
+                    [network, token_address],
+                ).fetchall()
+            prior = list(reversed(rows))
+            prices = [float(row[0]) for row in prior] + [price_usd]
+            reserves = [float(row[1]) for row in prior] + [reserve_usd]
+
+        if len(prices) != 5 or len(reserves) != 5:
+            return False, "insufficient_regime_history:requires_5_snapshots"
+        if any(not math.isfinite(value) or value <= 0 for value in prices + reserves):
+            return False, "invalid_regime_history"
+        if reserves[-1] <= reserves[0]:
+            return False, "liquidity_not_expanding_over_5_snapshots"
+        price_sma = sum(prices) / len(prices)
+        if price_usd <= price_sma:
+            return False, "price_not_above_5_snapshot_sma"
+        if min(prices[-3:]) <= min(prices[:3]):
+            return False, "no_higher_low_over_5_snapshots"
+        return True, "passed_5_snapshot_regime"
+
     def _open_token_amount(
         self, trader_handle: str, network: str, token_address: str
     ) -> float:
@@ -235,13 +366,17 @@ class ExecutionGatekeeper:
         exit_price: float | None,
         sell_order_id: str,
         exit_tranche: str | None = None,
+        sell_fee_usd: float = 0.0,
     ) -> None:
+        if not math.isfinite(sell_fee_usd) or sell_fee_usd < 0:
+            raise ValueError("SELL fee must be finite and non-negative")
         remaining_to_close = sold_amount
         realized_pnl = 0.0
         lots = cur.execute(
             """
             SELECT client_order_id, remaining_token_amount, entry_price_usd, unrealized_pnl_usd,
-                   tranche_1_sold_amount, tranche_2_sold_amount
+                   tranche_1_sold_amount, tranche_2_sold_amount,
+                   campaign_realized_pnl_usd, campaign_fees_usd
             FROM execution_orders
             WHERE side = 'BUY' AND trader_handle = ? AND network = ? AND token_address = ?
               AND status IN ('OPEN', 'DRY_RUN_OPEN') AND remaining_token_amount > 0
@@ -249,7 +384,16 @@ class ExecutionGatekeeper:
             """,
             [trader_handle, network, token_address],
         ).fetchall()
-        for buy_id, available, entry_price, unrealized, tranche_1_sold, tranche_2_sold in lots:
+        for (
+            buy_id,
+            available,
+            entry_price,
+            unrealized,
+            tranche_1_sold,
+            tranche_2_sold,
+            campaign_realized,
+            campaign_fees,
+        ) in lots:
             if remaining_to_close <= 0:
                 break
             close_amount = min(float(available), remaining_to_close)
@@ -263,6 +407,8 @@ class ExecutionGatekeeper:
                     unrealized_pnl_usd = ?,
                     tranche_1_sold_amount = ?,
                     tranche_2_sold_amount = ?,
+                    campaign_realized_pnl_usd = ?,
+                    campaign_fees_usd = ?,
                     status = CASE WHEN ? <= 1e-12 THEN 'CLOSED' ELSE status END,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE client_order_id = ?
@@ -276,6 +422,14 @@ class ExecutionGatekeeper:
                     ),
                     float(tranche_2_sold or 0) + (
                         close_amount if exit_tranche == "TAKE_PROFIT_2" else 0.0
+                    ),
+                    float(campaign_realized or 0) + (
+                        close_amount * (exit_price - float(entry_price))
+                        if exit_price is not None and entry_price is not None
+                        else 0.0
+                    ),
+                    float(campaign_fees or 0) + (
+                        sell_fee_usd * close_amount / sold_amount if sold_amount > 0 else 0.0
                     ),
                     new_remaining,
                     buy_id,
@@ -373,6 +527,7 @@ class ExecutionGatekeeper:
                 await self.scanner.evaluate_token(client, execution_network, token_address)
             )
             execution_network = str(market.get("network") or execution_network)
+            current_slot = self._current_slot(market)
             pool_metrics = {
                 "fdv_usd": market.get("fdv_usd"),
                 "volume_usd_h24": (
@@ -395,14 +550,77 @@ class ExecutionGatekeeper:
             reject_reason = ""
             if not market.get("passed"):
                 reject_reason = str(market.get("reason") or "market_gate_failed")
-            elif normalized_side == "BUY" and market.get("rsi_14") is None:
+            if normalized_side == "BUY" and not reject_reason:
+                last_exit_slot = self._last_exit_slot(execution_network, token_address)
+                if (
+                    last_exit_slot is not None
+                    and current_slot - last_exit_slot < REENTRY_COOLDOWN_SLOTS
+                ):
+                    remaining_slots = REENTRY_COOLDOWN_SLOTS - (
+                        current_slot - last_exit_slot
+                    )
+                    reject_reason = f"reentry_cooldown:{remaining_slots}_slots_remaining"
+                else:
+                    entry_slot = self._active_token_entry_slot(
+                        execution_network, token_address
+                    )
+                    if (
+                        entry_slot is not None
+                        and current_slot - entry_slot < MINIMUM_TREND_HOLD_SLOTS
+                    ):
+                        reject_reason = "minimum_trend_hold:additional_buy_ignored"
+            if normalized_side == "BUY" and not reject_reason and market.get("rsi_14") is None:
                 reject_reason = "missing_rsi"
             elif (
                 normalized_side == "BUY"
+                and not reject_reason
                 and float(market["rsi_14"]) > self.settings.max_entry_rsi_14
                 and consensus < 2
             ):
                 reject_reason = f"rsi_overbought:{float(market['rsi_14']):.1f}"
+            if normalized_side == "SELL" and not reject_reason and exit_tranche is None:
+                entry_slot = self._active_position_entry_slot(
+                    trader_handle, execution_network, token_address
+                )
+                if (
+                    entry_slot is not None
+                    and current_slot - entry_slot < MINIMUM_TREND_HOLD_SLOTS
+                ):
+                    with cursor_scope(self.db) as cur:
+                        position = cur.execute(
+                            """
+                            SELECT SUM(remaining_token_amount * entry_price_usd)
+                                       / NULLIF(SUM(remaining_token_amount), 0)
+                            FROM execution_orders
+                            WHERE side = 'BUY' AND trader_handle = ? AND network = ?
+                              AND token_address = ? AND remaining_token_amount > 0
+                              AND status IN ('OPEN', 'DRY_RUN_OPEN')
+                            """,
+                            [trader_handle, execution_network, token_address],
+                        ).fetchone()
+                    entry_price = float(position[0]) if position and position[0] else 0.0
+                    price = float(market.get("price_usd") or 0.0)
+                    pnl = (price - entry_price) / entry_price if entry_price > 0 else 0.0
+                    if not any(
+                        pnl <= threshold if threshold < 0 else pnl >= threshold
+                        for threshold in TREND_HOLD_EXIT_THRESHOLDS
+                    ):
+                        remaining_slots = MINIMUM_TREND_HOLD_SLOTS - (
+                            current_slot - entry_slot
+                        )
+                        reject_reason = (
+                            f"minimum_trend_hold:{remaining_slots}_slots_remaining"
+                        )
+            if normalized_side == "BUY" and not reject_reason:
+                passed_regime, regime_reason = self._passes_rolling_regime_filter(
+                    execution_network,
+                    token_address,
+                    float(pool_metrics.get("price_usd") or 0.0),
+                    float(pool_metrics.get("reserve_in_usd") or 0.0),
+                    market,
+                )
+                if not passed_regime:
+                    reject_reason = regime_reason
             if normalized_side == "BUY" and not reject_reason:
                 ohlcv_df = market.get("ohlcv_df")
                 if not isinstance(ohlcv_df, pd.DataFrame):
@@ -507,17 +725,28 @@ class ExecutionGatekeeper:
                 requested_notional = 0.0
                 token_amount = 0.0
 
-            ticket = PortfolioAllocator.size_ticket_usd(
-                bankroll_usd=self.settings.starting_bankroll_usd,
-                sleeve_weight=min(max(sleeve_weight, 0), 0.15),
-                pool_liquidity_usd=reserve,
-                max_ticket_pct=self.settings.max_single_ticket_pct,
-                max_pool_impact_pct=self.settings.max_pool_liquidity_impact_pct,
-                platform_fee_rate=self.router.fee_rate,
-                minimum_fee_usd=self.router.minimum_fee_usd,
-            )
             if normalized_side == "SELL":
-                ticket = min(ticket, requested_notional)
+                ticket = requested_notional
+                estimated_fee = max(
+                    self.router.minimum_fee_usd,
+                    ticket * self.router.fee_rate,
+                )
+                if ticket > 0 and estimated_fee / ticket > 0.015:
+                    return await self._reject(
+                        client_order_id, trader_handle, execution_network, token_address,
+                        market.get("pool_address", ""), normalized_side,
+                        "sell_fee_exceeds_1_5_percent",
+                    )
+            else:
+                ticket = PortfolioAllocator.size_ticket_usd(
+                    bankroll_usd=self.settings.starting_bankroll_usd,
+                    sleeve_weight=min(max(sleeve_weight, 0), 0.15),
+                    pool_liquidity_usd=reserve,
+                    max_ticket_pct=self.settings.max_single_ticket_pct,
+                    max_pool_impact_pct=self.settings.max_pool_liquidity_impact_pct,
+                    platform_fee_rate=self.router.fee_rate,
+                    minimum_fee_usd=self.router.minimum_fee_usd,
+                )
             if ticket <= 0:
                 return await self._reject(
                     client_order_id, trader_handle, execution_network, token_address,
@@ -526,6 +755,34 @@ class ExecutionGatekeeper:
             if normalized_side == "SELL":
                 token_amount = min(token_amount, ticket / price)
 
+            dlmm_metadata_value = market.get("meteora_dlmm_pool")
+            dlmm_metadata = (
+                dlmm_metadata_value if isinstance(dlmm_metadata_value, dict) else {}
+            )
+            dlmm_pool_address = (
+                market.get("meteora_dlmm_pool_address")
+                or (
+                    dlmm_metadata_value
+                    if isinstance(dlmm_metadata_value, str)
+                    else None
+                )
+                or dlmm_metadata.get("pool_address")
+                or dlmm_metadata.get("address")
+            )
+            active_bin_value = (
+                market.get("meteora_active_bin_id")
+                if market.get("meteora_active_bin_id") is not None
+                else dlmm_metadata.get("active_bin_id")
+            )
+            dlmm_liquidity_value = (
+                market.get("meteora_dlmm_liquidity_usd")
+                if market.get("meteora_dlmm_liquidity_usd") is not None
+                else dlmm_metadata.get("liquidity_usd")
+            )
+            try:
+                active_bin_id = int(active_bin_value) if active_bin_value is not None else None
+            except (TypeError, ValueError):
+                active_bin_id = None
             intent = OrderIntent(
                 client_order_id=client_order_id,
                 trader_handle=trader_handle,
@@ -536,6 +793,18 @@ class ExecutionGatekeeper:
                 price_usd=price,
                 pool_reserve_usd=reserve,
                 token_amount=token_amount,
+                high_conviction=consensus >= 2,
+                meteora_dlmm_pool_address=(
+                    str(dlmm_pool_address)
+                    if dlmm_pool_address and dlmm_metadata.get("active", True)
+                    else None
+                ),
+                meteora_active_bin_id=active_bin_id,
+                meteora_dlmm_liquidity_usd=(
+                    float(dlmm_liquidity_value)
+                    if dlmm_liquidity_value is not None
+                    else None
+                ),
             )
             exit_campaign_id: str | None = None
             if normalized_side == "BUY":
@@ -562,14 +831,14 @@ class ExecutionGatekeeper:
                     INSERT INTO execution_orders (
                         client_order_id, trader_handle, network, token_address, pool_address,
                         side, status, requested_usd, entry_atr_usd, exit_campaign_id,
-                        exit_tranche
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'INTENT', ?, ?, ?, ?)
+                        exit_tranche, signal_slot
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'INTENT', ?, ?, ?, ?, ?)
                     """,
                     [
                         client_order_id, trader_handle, execution_network, token_address,
                         market.get("pool_address", ""), normalized_side, ticket,
                         market.get("atr_14") if normalized_side == "BUY" else None,
-                        exit_campaign_id, exit_tranche,
+                        exit_campaign_id, exit_tranche, current_slot,
                     ],
                 )
                 cur.execute(
@@ -629,7 +898,9 @@ class ExecutionGatekeeper:
                     """
                     UPDATE execution_orders
                     SET status = ?, filled_usd = ?, filled_token_amount = ?, entry_price_usd = ?,
-                        high_water_price_usd = ?, fee_usd = ?, tx_hash_or_exchange_id = ?,
+                        high_water_price_usd = ?, fee_usd = ?,
+                        campaign_fees_usd = CASE WHEN side = 'BUY' THEN ? ELSE campaign_fees_usd END,
+                        tx_hash_or_exchange_id = ?,
                         execution_detail = ?,
                         remaining_token_amount = CASE WHEN side = 'BUY' THEN ? ELSE 0 END,
                         updated_at = CURRENT_TIMESTAMP
@@ -638,7 +909,8 @@ class ExecutionGatekeeper:
                     [
                         result.status, result.filled_usd, result.filled_token_amount,
                         result.average_price_usd or price,
-                        result.average_price_usd or price, result.fee_usd, result.tx_id,
+                        result.average_price_usd or price, result.fee_usd, result.fee_usd,
+                        result.tx_id,
                         result.detail,
                         result.filled_token_amount if normalized_side == "BUY" else 0,
                         client_order_id,
@@ -648,7 +920,7 @@ class ExecutionGatekeeper:
                     self._apply_sell_fill(
                         cur, trader_handle, execution_network, token_address,
                         result.filled_token_amount, result.average_price_usd or price, client_order_id,
-                        exit_tranche,
+                        exit_tranche, result.fee_usd,
                     )
             await self._notify(
                 f"Copy signal executed for {trader_handle}: {normalized_side} "

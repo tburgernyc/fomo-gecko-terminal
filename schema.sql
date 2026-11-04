@@ -83,10 +83,13 @@ CREATE TABLE IF NOT EXISTS execution_orders (
     tranche_2_sold_amount DOUBLE NOT NULL DEFAULT 0,
     fee_usd DOUBLE NOT NULL DEFAULT 0,
     realized_pnl_usd DOUBLE NOT NULL DEFAULT 0,
+    campaign_realized_pnl_usd DOUBLE NOT NULL DEFAULT 0,
+    campaign_fees_usd DOUBLE NOT NULL DEFAULT 0,
     unrealized_pnl_usd DOUBLE NOT NULL DEFAULT 0,
     tx_hash_or_exchange_id VARCHAR,
     execution_detail VARCHAR,
     failure_reason VARCHAR,
+    signal_slot BIGINT,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -100,9 +103,15 @@ ALTER TABLE execution_orders ADD COLUMN IF NOT EXISTS exit_tranche VARCHAR;
 ALTER TABLE execution_orders ADD COLUMN IF NOT EXISTS tranche_1_sold_amount DOUBLE DEFAULT 0;
 ALTER TABLE execution_orders ADD COLUMN IF NOT EXISTS tranche_2_sold_amount DOUBLE DEFAULT 0;
 ALTER TABLE execution_orders ADD COLUMN IF NOT EXISTS execution_detail VARCHAR;
+ALTER TABLE execution_orders ADD COLUMN IF NOT EXISTS signal_slot BIGINT;
+ALTER TABLE execution_orders ADD COLUMN IF NOT EXISTS campaign_realized_pnl_usd DOUBLE DEFAULT 0;
+ALTER TABLE execution_orders ADD COLUMN IF NOT EXISTS campaign_fees_usd DOUBLE DEFAULT 0;
 UPDATE execution_orders
 SET exit_campaign_id = client_order_id
 WHERE side = 'BUY' AND exit_campaign_id IS NULL;
+UPDATE execution_orders
+SET campaign_fees_usd = fee_usd
+WHERE side = 'BUY' AND campaign_fees_usd = 0 AND fee_usd > 0;
 
 CREATE TABLE IF NOT EXISTS equity_snapshots (
     ts TIMESTAMP PRIMARY KEY,

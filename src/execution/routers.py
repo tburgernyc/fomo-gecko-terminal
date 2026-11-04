@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import random
 import struct
 import time
@@ -141,6 +142,10 @@ class OrderIntent:
     pool_reserve_usd: float
     token_amount: float = 0.0
     token_amount_raw: int | None = None
+    high_conviction: bool = False
+    meteora_dlmm_pool_address: str | None = None
+    meteora_active_bin_id: int | None = None
+    meteora_dlmm_liquidity_usd: float | None = None
 
 
 @dataclass(frozen=True)
@@ -158,6 +163,10 @@ class SubmissionUncertain(RuntimeError):
     def __init__(self, message: str, tx_id: str | None):
         super().__init__(message)
         self.tx_id = tx_id
+
+
+class JitoBundleRejected(RuntimeError):
+    """A definitive block-engine rejection that is safe to retry with a higher tip."""
 
 
 class OrderRouter(Protocol):
@@ -423,6 +432,51 @@ class DirectOnChainRouter:
         return body
 
     async def _submit_solana(self, intent: OrderIntent) -> ExecutionResult:
+        retry_limit = 4 if intent.side == "SELL" else 0
+        last_error: JitoBundleRejected | None = None
+        for retry_index in range(retry_limit + 1):
+            try:
+                return await self._submit_solana_once(
+                    intent,
+                    tip_multiplier=1.75**retry_index,
+                )
+            except JitoBundleRejected as exc:
+                if intent.side != "SELL":
+                    raise
+                last_error = exc
+                if retry_index == retry_limit:
+                    break
+                logger.warning(
+                    "Jito rejected SELL %s; retry %d/%d will use a %.2fx tip in the "
+                    "next slot",
+                    intent.client_order_id,
+                    retry_index + 1,
+                    retry_limit,
+                    1.75 ** (retry_index + 1),
+                )
+                await self._wait_for_next_solana_slot()
+        if last_error is None:
+            raise RuntimeError("Jito SELL retry loop exited without a result")
+        raise RuntimeError(
+            f"Jito rejected SELL after {retry_limit} escalated retries: {last_error}"
+        ) from last_error
+
+    async def _wait_for_next_solana_slot(self) -> None:
+        """Wait for a strictly newer processed slot before rebuilding a rejected bundle."""
+        current = await self._solana_rpc("getSlot", [{"commitment": "processed"}])
+        if not isinstance(current, int) or current < 0:
+            raise RuntimeError("Solana RPC returned an invalid processed slot")
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+            next_slot = await self._solana_rpc("getSlot", [{"commitment": "processed"}])
+            if isinstance(next_slot, int) and next_slot > current:
+                return
+        raise TimeoutError(f"Solana slot did not advance beyond {current} within 2 seconds")
+
+    async def _submit_solana_once(
+        self, intent: OrderIntent, *, tip_multiplier: float
+    ) -> ExecutionResult:
         private_key = self.settings.solana_private_key.get_secret_value()
         if not private_key:
             raise RuntimeError("SOLANA_PRIVATE_KEY is required for live Solana execution")
@@ -446,6 +500,10 @@ class DirectOnChainRouter:
         )
         fee_budget = self.settings.solana_fee_budget_lamports
         priority_fee_lamports, jito_tip_lamports = compute_fee_split(fee_budget)
+        jito_tip_lamports = max(
+            MIN_JITO_TIP_LAMPORTS,
+            int(jito_tip_lamports * tip_multiplier),
+        )
         swap_instructions = await self._post_json(
             f"{base_url}/swap-instructions",
             build_jupiter_swap_payload(quote, str(wallet.pubkey()), fee_budget),
@@ -519,6 +577,8 @@ class DirectOnChainRouter:
         decimals = await self._solana_token_decimals(out_mint)
         try:
             bundle_id = await self._send_jito_bundle(bytes(signed))
+        except JitoBundleRejected:
+            raise
         except Exception as exc:
             raise SubmissionUncertain(
                 f"Jito bundle submission outcome is unknown: {exc}", signature
@@ -531,7 +591,8 @@ class DirectOnChainRouter:
             tx_id=signature,
             detail=(
                 f"jito_bundle_id={bundle_id};priority_fee_lamports={priority_fee_lamports};"
-                f"jito_tip_lamports={jito_tip_lamports}"
+                f"jito_tip_lamports={jito_tip_lamports};"
+                f"jito_tip_multiplier={tip_multiplier:.6f}"
             ),
         )
 
@@ -564,10 +625,15 @@ class DirectOnChainRouter:
             },
             timeout=20,
         )
+        if response.status_code == 429 or 400 <= response.status_code < 500:
+            raise JitoBundleRejected(
+                f"Jito rejected bundle with HTTP {response.status_code}: "
+                f"{response.text[:500]}"
+            )
         response.raise_for_status()
         body = response.json()
         if not isinstance(body, dict) or body.get("error"):
-            raise RuntimeError(f"Jito rejected bundle submission: {body}")
+            raise JitoBundleRejected(f"Jito rejected bundle submission: {body}")
         bundle_id = body.get("result")
         if not isinstance(bundle_id, str) or not bundle_id:
             raise ValueError("Jito returned no bundle ID")
@@ -844,6 +910,263 @@ class DirectOnChainRouter:
             self._solana_client = None
         if self._owns_client:
             await self.client.aclose()
+
+
+async def route_jit_dlmm_order(
+    intent: OrderIntent,
+    *,
+    sidecar_url: str,
+    pool_address: str,
+    active_bin_id: int,
+    pool_liquidity_usd: float,
+    minimum_liquidity_usd: float,
+    client: httpx.AsyncClient | None = None,
+) -> ExecutionResult:
+    """Atomically buy and seed a DLMM bin ladder through a configured sidecar.
+
+    The sidecar must return an OPEN, atomically confirmed fill and confirm that its
+    high-water-mark reversal withdrawal is armed. No success-shaped fallback is used.
+    """
+    if intent.side != "BUY":
+        raise ValueError("Meteora DLMM JIT routing supports BUY intents only")
+    if intent.network.lower() not in {"solana", "sol", "1399811149"}:
+        raise ValueError("Meteora DLMM routing is only supported on Solana")
+    if not sidecar_url.strip():
+        raise RuntimeError("METEORA_DLMM_SIDECAR_URL is required for DLMM routing")
+    if not pool_address.strip():
+        raise ValueError("an active DLMM pool address is required")
+    if (
+        not math.isfinite(pool_liquidity_usd)
+        or not math.isfinite(minimum_liquidity_usd)
+        or minimum_liquidity_usd <= 0
+        or pool_liquidity_usd < minimum_liquidity_usd
+    ):
+        raise ValueError("DLMM pool liquidity is below the configured minimum")
+    if intent.notional_usd <= 0 or intent.price_usd <= 0:
+        raise ValueError("DLMM BUY requires positive notional and reference price")
+
+    owns_client = client is None
+    http_client = client or httpx.AsyncClient()
+    try:
+        response = await http_client.post(
+            sidecar_url,
+            json={
+                "operation": "open_jit_position",
+                "client_order_id": intent.client_order_id,
+                "token_mint": intent.token_address,
+                "pool_address": pool_address,
+                "input_amount_usd": intent.notional_usd,
+                "active_bin_id": active_bin_id,
+                "bin_ladder": {
+                    "from_bin_id": active_bin_id + 2,
+                    "to_bin_id": active_bin_id + 14,
+                    "strategy": "single_sided_upward_bid_ask",
+                },
+                "atomic": True,
+                "withdraw_on_high_water_reversal": {
+                    "enabled": True,
+                    "trigger": "price_below_active_high_water_mark",
+                    "action": "withdraw_all",
+                },
+            },
+            headers={
+                "Content-Type": "application/json",
+                "Idempotency-Key": intent.client_order_id,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+    finally:
+        if owns_client:
+            await http_client.aclose()
+
+    if not isinstance(data, dict):
+        raise ValueError("Meteora sidecar response must be a JSON object")
+    if data.get("error"):
+        raise RuntimeError(f"Meteora sidecar rejected JIT order: {data['error']}")
+    if data.get("atomic") is not True:
+        raise RuntimeError("Meteora sidecar did not confirm atomic acquisition and seeding")
+    if data.get("hwm_withdrawal_armed") is not True:
+        raise RuntimeError("Meteora sidecar did not arm the high-water-mark withdrawal")
+    if str(data.get("status", "")).upper() != "OPEN":
+        raise RuntimeError(f"Meteora sidecar returned non-final status: {data.get('status')}")
+    try:
+        filled_usd = float(data["filled_usd"])
+        filled_token_amount = float(data["filled_token_amount"])
+        fee_usd = float(data.get("fee_usd", 0.0))
+        average_price_usd = float(data["average_price_usd"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Meteora sidecar returned incomplete fill metrics") from exc
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (filled_usd, filled_token_amount, fee_usd, average_price_usd)
+        )
+        or filled_usd <= 0
+        or filled_token_amount <= 0
+        or fee_usd < 0
+        or average_price_usd <= 0
+    ):
+        raise ValueError("Meteora sidecar returned invalid fill metrics")
+    tx_id = data.get("tx_id")
+    if not isinstance(tx_id, str) or not tx_id:
+        raise ValueError("Meteora sidecar returned no transaction ID")
+    return ExecutionResult(
+        status="OPEN",
+        filled_usd=filled_usd,
+        filled_token_amount=filled_token_amount,
+        fee_usd=fee_usd,
+        average_price_usd=average_price_usd,
+        tx_id=tx_id,
+        detail=(
+            f"meteora_dlmm=true;atomic=true;pool={pool_address};"
+            f"bin_ladder={active_bin_id + 2}:{active_bin_id + 14};"
+            "hwm_withdrawal_armed=true"
+        ),
+    )
+
+
+class MeteoraDLMMHybridRouter:
+    """Route qualifying whale buys through DLMM and delegate all other orders."""
+
+    def __init__(
+        self, base_router: OrderRouter, settings: Settings, client: httpx.AsyncClient
+    ) -> None:
+        self.base_router = base_router
+        self.settings = settings
+        self.client = client
+        self.fee_rate = base_router.fee_rate
+        self.minimum_fee_usd = base_router.minimum_fee_usd
+
+    def supports_network(self, network: str) -> bool:
+        return self.base_router.supports_network(network)
+
+    async def _discover_active_pool(
+        self, token_address: str
+    ) -> tuple[str, int, float] | None:
+        if not self.settings.meteora_dlmm_sidecar_url:
+            return None
+        response = await self.client.post(
+            self.settings.meteora_dlmm_sidecar_url,
+            json={"operation": "find_active_pool", "token_mint": token_address},
+            timeout=20,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError("Meteora pool discovery response must be a JSON object")
+        status = str(data.get("status", "")).upper()
+        if status in {"NOT_FOUND", "INACTIVE"}:
+            return None
+        if status != "FOUND" or data.get("active") is not True:
+            raise ValueError(f"Meteora sidecar returned invalid pool discovery state: {status}")
+        pool_address = data.get("pool_address")
+        try:
+            active_bin_id = int(data["active_bin_id"])
+            liquidity_usd = float(data["liquidity_usd"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Meteora sidecar returned incomplete pool metadata") from exc
+        if (
+            not isinstance(pool_address, str)
+            or not pool_address
+            or not math.isfinite(liquidity_usd)
+            or liquidity_usd <= 0
+        ):
+            raise ValueError("Meteora sidecar returned invalid pool metadata")
+        return pool_address, active_bin_id, liquidity_usd
+
+    async def submit(self, intent: OrderIntent) -> ExecutionResult:
+        if intent.side == "BUY" and intent.high_conviction:
+            pool_address = intent.meteora_dlmm_pool_address
+            active_bin_id = intent.meteora_active_bin_id
+            liquidity_usd = intent.meteora_dlmm_liquidity_usd
+            if pool_address is None and self.settings.meteora_dlmm_sidecar_url:
+                discovered_pool = await self._discover_active_pool(intent.token_address)
+                if discovered_pool is not None:
+                    pool_address, active_bin_id, liquidity_usd = discovered_pool
+            if pool_address is not None:
+                if active_bin_id is None:
+                    raise ValueError("active Meteora DLMM bin ID is missing")
+                if liquidity_usd is None:
+                    liquidity_usd = intent.pool_reserve_usd
+                if liquidity_usd < self.settings.meteora_dlmm_min_liquidity_usd:
+                    logger.info(
+                        "Meteora DLMM pool %s is below minimum liquidity; using base router",
+                        pool_address,
+                    )
+                    return await self.base_router.submit(intent)
+                if not self.settings.meteora_dlmm_sidecar_url:
+                    raise RuntimeError(
+                        "METEORA_DLMM_SIDECAR_URL is required for an active DLMM pool"
+                    )
+                return await route_jit_dlmm_order(
+                    intent,
+                    sidecar_url=self.settings.meteora_dlmm_sidecar_url,
+                    pool_address=pool_address,
+                    active_bin_id=active_bin_id,
+                    pool_liquidity_usd=liquidity_usd,
+                    minimum_liquidity_usd=self.settings.meteora_dlmm_min_liquidity_usd,
+                    client=self.client,
+                )
+        return await self.base_router.submit(intent)
+
+    async def reconcile(
+        self, client_order_id: str, tx_id: str | None
+    ) -> str | ExecutionResult:
+        if not self.settings.meteora_dlmm_sidecar_url:
+            return await self.base_router.reconcile(client_order_id, tx_id)
+        response = await self.client.post(
+            self.settings.meteora_dlmm_sidecar_url,
+            json={"operation": "get_order_status", "client_order_id": client_order_id},
+            headers={"Idempotency-Key": client_order_id},
+            timeout=20,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError("Meteora sidecar status response must be a JSON object")
+        status = str(data.get("status", "")).upper()
+        if status in {"NOT_FOUND", "UNSUPPORTED"}:
+            return await self.base_router.reconcile(client_order_id, tx_id)
+        if status == "UNCERTAIN":
+            return "UNCERTAIN"
+        if status not in {"OPEN", "FAILED"}:
+            raise ValueError(f"Meteora sidecar returned invalid order state: {status}")
+        if status == "FAILED":
+            return "FAILED"
+        try:
+            filled_usd = float(data["filled_usd"])
+            filled_token_amount = float(data["filled_token_amount"])
+            fee_usd = float(data.get("fee_usd", 0.0))
+            average_price_usd = float(data["average_price_usd"])
+            resolved_tx_id = str(data.get("tx_id") or tx_id or client_order_id)
+            if (
+                not all(
+                    math.isfinite(value)
+                    for value in (filled_usd, filled_token_amount, fee_usd, average_price_usd)
+                )
+                or filled_usd <= 0
+                or filled_token_amount <= 0
+                or fee_usd < 0
+                or average_price_usd <= 0
+                or not resolved_tx_id
+            ):
+                raise ValueError("Meteora sidecar returned invalid reconciliation metrics")
+            return ExecutionResult(
+                status="OPEN",
+                filled_usd=filled_usd,
+                filled_token_amount=filled_token_amount,
+                fee_usd=fee_usd,
+                average_price_usd=average_price_usd,
+                tx_id=resolved_tx_id,
+                detail="meteora_dlmm=true;reconciled=true",
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Meteora sidecar returned incomplete reconciliation data") from exc
+
+    async def close(self) -> None:
+        await close_router(self.base_router)
 
 
 async def close_router(router: OrderRouter) -> None:

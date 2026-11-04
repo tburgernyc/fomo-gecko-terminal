@@ -146,3 +146,41 @@ async def test_dropped_bundle_still_deducts_fixed_fees(tmp_path):
         assert router.attempts[0]["status"] == "FAILED"
     finally:
         replayer.close()
+
+
+@pytest.mark.asyncio
+async def test_sell_drops_escalate_tip_and_force_inclusion(tmp_path):
+    replayer = HistoricalReplayer(_write_events(tmp_path / "events.parquet"))
+    try:
+        iterator = replayer.stream_events()
+        await anext(iterator)
+        router = SimulatedOnChainRouter(
+            replayer, failure_probability=1.0, seed=4
+        )
+        intent = OrderIntent(
+            client_order_id="retry-sell",
+            trader_handle="test-trader",
+            network="solana",
+            token_address=TOKEN,
+            side="SELL",
+            notional_usd=100.0,
+            price_usd=0.001,
+            pool_reserve_usd=50_000.0,
+            token_amount=10_000.0,
+        )
+
+        result = await router.submit(intent)
+
+        assert result.status == "OPEN"
+        assert len(router.attempts) == 5
+        assert [item["execution_slot"] for item in router.attempts] == [12, 13, 14, 15, 16]
+        assert [item["jito_tip_multiplier"] for item in router.attempts] == pytest.approx(
+            [1, 1.75, 1.75**2, 1.75**3, 1.75**4]
+        )
+        assert [item["status"] for item in router.attempts] == [
+            "FAILED", "FAILED", "FAILED", "FAILED", "OPEN"
+        ]
+        assert router.attempts[-1]["priority_tip_inclusion"] is True
+        assert result.fee_usd == pytest.approx(router.total_fees_paid_usd)
+    finally:
+        replayer.close()

@@ -24,6 +24,7 @@ from src.config import Settings
 from src.execution.gatekeeper import ExecutionGatekeeper
 from src.execution.simulated_router import SimulatedOnChainRouter
 from src.ingestion.historical_replayer import HistoricalReplayer
+from src.main import monitor_open_positions
 
 logger = logging.getLogger(__name__)
 DEFAULT_PARQUET = ROOT / "data" / "mock_solana_pools.parquet"
@@ -113,6 +114,7 @@ def _write_attempts(
             execution_slot BIGINT,
             notional_usd DOUBLE,
             priority_fee_sol DOUBLE,
+            jito_tip_multiplier DOUBLE,
             fee_usd DOUBLE,
             status VARCHAR,
             fill_price_usd DOUBLE,
@@ -123,7 +125,7 @@ def _write_attempts(
     if router.attempts:
         ledger.executemany(
             """
-            INSERT INTO simulation_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO simulation_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -134,6 +136,7 @@ def _write_attempts(
                     attempt["execution_slot"],
                     attempt["notional_usd"],
                     attempt["priority_fee_sol"],
+                    attempt["jito_tip_multiplier"],
                     attempt["fee_usd"],
                     attempt["status"],
                     attempt["fill_price_usd"],
@@ -144,18 +147,18 @@ def _write_attempts(
         )
 
 
-def _print_report(ledger: duckdb.DuckDBPyConnection) -> None:
-    metrics = ledger.execute(
+def _print_report(ledger: duckdb.DuckDBPyConnection) -> dict[str, float | int]:
+    campaigns = ledger.execute(
         """
-        SELECT
-            COUNT(*) FILTER (WHERE side IN ('BUY', 'SELL') AND status = 'OPEN') AS total_trades,
-            COUNT(*) FILTER (WHERE side = 'SELL' AND status = 'OPEN'
-                             AND realized_pnl_usd > 0) AS winning_trades,
-            COUNT(*) FILTER (WHERE side = 'SELL' AND status = 'OPEN') AS closed_trades,
-            COALESCE(SUM(realized_pnl_usd + unrealized_pnl_usd), 0.0) AS gross_pnl
+        SELECT exit_campaign_id,
+               SUM(campaign_realized_pnl_usd + unrealized_pnl_usd) AS pnl_usd,
+               SUM(campaign_fees_usd) AS campaign_fees_usd,
+               SUM(remaining_token_amount) AS remaining_token_amount
         FROM execution_orders
+        WHERE side = 'BUY' AND filled_token_amount > 0
+        GROUP BY exit_campaign_id
         """
-    ).fetchone()
+    ).fetchall()
     fees = float(
         ledger.execute("SELECT COALESCE(SUM(fee_usd), 0.0) FROM simulation_attempts").fetchone()[0]
     )
@@ -176,20 +179,43 @@ def _print_report(ledger: duckdb.DuckDBPyConnection) -> None:
             """
         ).fetchone()[0]
     )
-    total_trades, winning_trades, closed_trades, gross_pnl = metrics
-    win_rate = (float(winning_trades) / int(closed_trades)) if closed_trades else 0.0
-    gross_pnl = float(gross_pnl)
+    closed_campaign_pnls = [
+        float(pnl or 0.0) - float(campaign_fees or 0.0)
+        for _, pnl, campaign_fees, remaining in campaigns
+        if float(remaining or 0.0) <= 1e-12
+    ]
+    campaign_gross_pnls = [float(pnl or 0.0) for _, pnl, _, _ in campaigns]
+    wins = sum(pnl > 0 for pnl in closed_campaign_pnls)
+    win_rate = wins / len(closed_campaign_pnls) if closed_campaign_pnls else 0.0
+    gross_pnl = sum(campaign_gross_pnls)
+    positive_pnl = sum(pnl for pnl in closed_campaign_pnls if pnl > 0)
+    negative_pnl = sum(pnl for pnl in closed_campaign_pnls if pnl < 0)
+    profit_factor = positive_pnl / abs(negative_pnl) if negative_pnl < 0 else float("inf")
 
-    table = Table(title="Latency-Aware Solana Backtest")
+    table = Table(title="Institutional Campaign Backtest Audit")
     table.add_column("Metric", style="cyan")
     table.add_column("Result", justify="right", style="green")
-    table.add_row("Total Trades", str(total_trades))
-    table.add_row("Win Rate", f"{win_rate:.2%} ({winning_trades}/{closed_trades} sells)")
+    table.add_row("Total Campaigns", str(len(campaigns)))
+    table.add_row(
+        "Win Rate",
+        f"{win_rate:.2%} ({wins}/{len(closed_campaign_pnls)} closed campaigns)",
+    )
     table.add_row("Gross PnL", f"${gross_pnl:,.2f}")
     table.add_row("Total Fees Paid", f"${fees:,.4f}")
     table.add_row("Net PnL", f"${gross_pnl - fees:,.2f}")
+    table.add_row("Profit Factor", f"{profit_factor:.3f}")
     table.add_row("Maximum Drawdown", f"{drawdown:.2%}")
     Console().print(table)
+    return {
+        "total_campaigns": len(campaigns),
+        "closed_campaigns": len(closed_campaign_pnls),
+        "win_rate": win_rate,
+        "gross_pnl_usd": gross_pnl,
+        "total_fees_usd": fees,
+        "net_pnl_usd": gross_pnl - fees,
+        "profit_factor": profit_factor,
+        "max_drawdown": drawdown,
+    }
 
 
 async def run_backtest(
@@ -259,13 +285,16 @@ async def run_backtest(
                         result,
                     )
 
+                await monitor_open_positions(
+                    client, ledger, replayer, gatekeeper, settings
+                )
                 _append_equity_snapshot(
                     ledger, event_count, timestamp, router, replayer
                 )
 
         _finalize_open_positions(ledger, replayer)
         _write_attempts(ledger, router)
-        _print_report(ledger)
+        audit_metrics = _print_report(ledger)
         logger.info(
             "Backtest complete: %d events, %d FOMO signals, %d execution attempts",
             event_count,
@@ -277,6 +306,7 @@ async def run_backtest(
             "signals_processed": signals_processed,
             "attempt_count": len(router.attempts),
             "cash_balance_usd": router.cash_balance_usd,
+            "audit_metrics": audit_metrics,
         }
     finally:
         gatekeeper_module.time = original_clock
